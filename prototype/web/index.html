@@ -1,0 +1,210 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mini vMac snapshot spike</title>
+<style>
+  body { font: 13px/1.4 ui-monospace, Menlo, monospace; background: #111; color: #ddd; margin: 16px; }
+  canvas { border: 1px solid #333; image-rendering: pixelated; width: 1024px; }
+  pre { white-space: pre-wrap; }
+</style>
+<canvas id="view" width="512" height="342"></canvas>
+<pre id="out"></pre>
+<script type="module">
+// Mini vMac (Mac Plus, all-out speed) + System 6.0.8.
+//   ?mode=boot&build=base|async&n=5   cold boot to a settled Finder, then open Calculator (speed baseline)
+//   ?mode=make                        cold boot (async build), snapshot, upload uploads/snap.bin
+//   ?mode=restore&src=uploads/snap.bin[.gz]&n=5   fresh page: fetch the snapshot, restore it into a new worker,
+//                                     then check the Mac is alive (Apple menu, then Calculator read from disk)
+const Q = new URLSearchParams(location.search);
+const MODE = Q.get("mode") || "boot", BUILD = Q.get("build") || "async", N = +(Q.get("n") || 1);
+const EMU = Q.get("emu") || "minivmac";
+const BASILISK_PREFS = ["frameskip 0", "fpu true", "nocdrom true", "nosound true", "nogui true", "jit false",
+  "keyboardtype 5", "keycodes false", "mousewheelmode 1", "idlewait true", "bootdrive 0", "bootdriver 0",
+  "rom /quadra650.rom", "cpu 4", "modelid 30", `ramsize ${(+(Q.get("ram") || 32)) << 20}`, "screen win/640/480",
+  "disk /system.dsk", "jsfrequentreadinput true"].join("\n") + "\n";
+const SHEEP_PREFS = ["windowmodes 0", "screenmodes 0", "frameskip 0", "gfxaccel false", "nocdrom true", "nonet true",
+  "nosound true", "nogui true", "ignoresegv true", "ignoreillegal false", "jit false", "jit68k false", "keyboardtype 5",
+  "keycodes false", "mousewheelmode 1", "idlewait true", "bootdrive 0", "bootdriver 0", `rom /${Q.get("rom") || "pm9500.rom"}`,
+  `ramsize ${(+(Q.get("ram") || 64)) << 20}`, "screen win/640/480", "disk /system.dsk", "jsfrequentreadinput true"].join("\n") + "\n";
+const EMUS = {
+  minivmac: { module: b => `./out/${b}.mjs`, rom: "mac-plus.rom", romPath: "/mac-plus.rom", disk: "system608.dsk", args: [],
+    prefs: "rom /mac-plus.rom\ndisk /system.dsk\nscreen win/512/342\n", calc: [60, 107] },
+  basilisk: { module: b => `./bout/${b}.mjs`, rom: "quadra650.rom", romPath: "/quadra650.rom", disk: "system753.dsk",
+    args: ["--config", "/prefs"], prefs: BASILISK_PREFS, guard: { cpu: "m68k_execute", forbid: "idle_wait" }, calc: (Q.get("calc") || "60,107").split(",").map(Number) },
+  sheepshaver: { module: b => `./bout/sheep-${b}.mjs`, rom: Q.get("rom") || "pm9500.rom", romPath: "/" + (Q.get("rom") || "pm9500.rom"), disk: Q.get("disk") || "system753ppc.dsk",
+    args: ["--config", "/prefs"], prefs: SHEEP_PREFS, guard: { cpu: "powerpc_cpu::execute(\\(|\\\\28)", forbid: "execute_sheep|idle_wait" }, calc: (Q.get("calc") || "60,107").split(",").map(Number) },
+};
+const E = EMUS[EMU];
+const SNAP = Q.get("snapname") || EMU;
+const out = document.getElementById("out");
+const log = (...a) => { const l = `+${(performance.now() / 1000).toFixed(2)}s ${a.join(" ")}`; out.textContent += l + "\n"; console.log(l); };
+window.RESULTS = { mode: MODE, build: BUILD, runs: [], done: false, ua: navigator.userAgent };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const C = { PENDING: 0, MOUSE_FLAG: 1, X: 2, Y: 3, BUTTON: 4, SNAPSHOT: 10 };
+const view = document.getElementById("view"), ctx = view.getContext("2d");
+
+let frame = null, frameAt = 0, onMsg = () => {};
+function show(m) {
+  if (view.width !== m.w) { view.width = m.w; view.height = m.h; }
+  const img = ctx.createImageData(m.w, m.h);
+  img.data.set(m.px);
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;   // Mini vMac leaves alpha at 0 for black
+  ctx.putImageData(img, 0, 0);
+}
+function startWorker(init, transfer = []) {
+  const buf = new SharedArrayBuffer(64), ctrl = new Int32Array(buf); ctrl[C.BUTTON] = -1;
+  const w = new Worker("emu-worker.mjs", { type: "module" });
+  w.onmessage = ({ data: m }) => {
+    if (m.type === "log" && !m.text.startsWith("calls")) log("  worker:", m.text);
+    if (m.type === "frame") { frame = m; frameAt = performance.now(); show(m); }
+    onMsg(m);
+  };
+  w.onerror = e => log("worker error", e.message);
+  const { build, rom, ...rest } = init;
+  w.postMessage({ ...rest, module: E.module(build), args: E.args, guard: E.guard, diskName: "/system.dsk",
+    files: { [E.romPath]: rom, "/prefs": E.prefs }, ctrl: buf }, transfer);
+  return { w, ctrl };
+}
+const pix = (f, x, y) => f.px[(y * f.w + x) * 4];          // 0 = black, 255 = white
+const menubar = f => { if (!f) return false; for (let x = 0; x < f.w; x += 8) if (pix(f, x, 19) !== 0) return false;
+  let white = 0; for (let x = 0; x < f.w; x += 8) white += pix(f, x, 3) === 255; return white > f.w / 16; };
+const diff = (a, b) => { let n = 0; for (let i = 0; i < a.px.length; i += 4) n += (a.px[i] !== b.px[i]); return n; };
+async function waitFor(pred, limit = 120000) {
+  const t0 = performance.now();
+  while (performance.now() - t0 < limit) { if (pred()) return performance.now(); await sleep(5); }
+  throw new Error("timeout");
+}
+const waitMsg = type => new Promise(res => { const prev = onMsg; onMsg = m => { prev(m); if (m.type === type) { onMsg = prev; res(m); } }; });
+const upload = (name, data) => fetch("uploads/" + name, { method: "PUT", body: data });
+async function shot(name) { await upload(name, await new Promise(r => view.toBlob(r))); }
+function mouse(ctrl, x, y, button) {
+  Atomics.store(ctrl, C.X, x); Atomics.store(ctrl, C.Y, y); Atomics.store(ctrl, C.MOUSE_FLAG, 1);
+  Atomics.store(ctrl, C.BUTTON, button); Atomics.store(ctrl, C.PENDING, 1);
+}
+const fetchBuf = u => fetch(u).then(r => { if (!r.ok) throw new Error(u + " " + r.status); return r.arrayBuffer(); });
+
+async function interact(r, ctrl, i, tag) {
+  const base = frame;
+  mouse(ctrl, 20, 8, 1);
+  const tM = performance.now();
+  await waitFor(() => frame !== base && diff(frame, base) > 200, 10000);
+  r.menu_open_ms = performance.now() - tM;
+  await sleep(300);
+  if (i === 0) await shot(`${tag}-applemenu.png`);
+  mouse(ctrl, E.calc[0], E.calc[1], 1); await sleep(300);    // drag to "Calculator"
+  const menuFrame = frame;
+  mouse(ctrl, E.calc[0], E.calc[1], 0);
+  const tC = performance.now();
+  try { await waitFor(() => frame !== menuFrame && diff(frame, base) > 1500, 10000); r.calculator_open_ms = performance.now() - tC; }
+  catch { r.calculator_open_ms = null; }
+  try { await waitFor(() => performance.now() - frameAt > 500, 20000); r.calculator_settled_ms = frameAt - tC; } catch {}
+  log(i, `apple menu ${r.menu_open_ms.toFixed(1)} ms, calculator ${r.calculator_open_ms?.toFixed(1)} ms`);
+  await sleep(+(Q.get("afterms") || 800));
+  if (i === 0) await shot(`${tag}-calculator.png`);
+}
+
+// Emulation speed: Mac Ticks (1/60 s of emulated time) per real second, measured at the idle Finder.
+async function speed(r, secs = 5) {
+  const samples = []; const prev = onMsg;
+  onMsg = m => { prev(m); if (m.type === "ticks") samples.push(m); };
+  await sleep(secs * 1000 + 1100); onMsg = prev;
+  const a = samples[0], b = samples[samples.length - 1];
+  r.speed_x = (b.ticks - a.ticks) / 60 / ((b.t - a.t) / 1000);
+  log(`speed ${r.speed_x.toFixed(1)}x real time (${samples.length} samples)`);
+}
+
+async function boot(i, rom, disk) {
+  const r = {};
+  frame = null;
+  const t0 = performance.now();
+  const { w, ctrl } = startWorker({ build: BUILD, rom, disk, throttle: +(Q.get("throttle") ?? 100) });
+  const menuText = f => { if (!f) return false; let n = 0;       // dark pixels where the Finder's menu titles sit
+    for (let y = 4; y < 16; y++) for (let x = 40; x < 300; x++) n += f.px[(y * f.w + x) * 4] < 60; return n > 80; };
+  if (Q.get("detect") === "menutext") await waitFor(() => menuText(frame) && performance.now() - frameAt > 3000, 300000);
+  else if (Q.get("detect") === "settle") await waitFor(() => frame && performance.now() - t0 > 5000 && performance.now() - frameAt > 3000, 300000);
+  else await waitFor(() => menubar(frame));
+  r.boot_desktop_s = (performance.now() - t0) / 1000;
+  await waitFor(() => performance.now() - frameAt > 2000);
+  r.boot_settled_s = (frameAt - t0) / 1000;
+  log(i, `desktop ${r.boot_desktop_s.toFixed(2)} s, settled ${r.boot_settled_s.toFixed(2)} s`);
+  return { r, w, ctrl };
+}
+
+// Snapshot file: u32 header length | JSON header | memory | written disk chunks
+function pack(s) {
+  const head = new TextEncoder().encode(JSON.stringify({ build: BUILD, clock: s.clock, sp: s.sp, currData: s.currData, rewindId: s.rewindId,
+    rewindName: s.rewindName, video: s.video, memBytes: s.mem.byteLength,
+    disks: s.disks.map(d => ({ name: d.name, chunks: d.chunks, bytes: d.data.byteLength })) }));
+  return new Blob([new Uint32Array([head.length]), head, s.mem, ...s.disks.map(d => d.data)]);
+}
+function unpack(buf) {
+  const n = new Uint32Array(buf, 0, 1)[0];
+  const h = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, n)));
+  let p = 4 + n;
+  const mem = buf.slice(p, p + h.memBytes); p += h.memBytes;
+  const disks = h.disks.map(d => { const data = new Uint8Array(buf.slice(p, p + d.bytes)); p += d.bytes; return { name: d.name, chunks: d.chunks, data }; });
+  return { ...h, mem: new Uint8Array(mem), disks };
+}
+
+async function make(rom, disk) {
+  const { r, w, ctrl } = await boot(0, rom, disk);
+  await shot(`snap-${SNAP}-source.png`);
+  const tS = performance.now(), got = waitMsg("snapshot");
+  Atomics.store(ctrl, C.SNAPSHOT, 1);
+  const { s } = await got;
+  r.snapshot_ms = performance.now() - tS; r.snapshot_copy_ms = s.copy_ms;
+  r.disk_chunks_written = s.disks.reduce((a, d) => a + d.chunks.length, 0);
+  const blob = pack(s); r.file_mb = blob.size / 1048576;
+  await upload(`snap-${SNAP}.bin`, blob);
+  log(`snapshot ${r.snapshot_ms.toFixed(1)} ms, file ${r.file_mb.toFixed(1)} MB, ${r.disk_chunks_written} disk chunks written`);
+  w.terminate();
+  return r;
+}
+
+async function restore(i, rom, disk) {
+  const r = {}, src = Q.get("src") || `uploads/snap-${SNAP}.bin`;
+  frame = null;
+  const t0 = performance.now();
+  let buf = await fetchBuf(src);
+  r.fetch_ms = performance.now() - t0; r.fetched_mb = buf.byteLength / 1048576;
+  if (src.endsWith(".gz")) {
+    const t = performance.now();
+    buf = await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+    r.decompress_ms = performance.now() - t;
+  }
+  const s = unpack(buf);
+  const t1 = performance.now();
+  const restored = waitMsg("restored");
+  const { w, ctrl } = startWorker({ build: s.build, rom, disk: disk.slice(0), snapshot: s, noClockFix: Q.has("noclockfix") }, [s.mem.buffer, ...s.disks.map(d => d.data.buffer)]);
+  r.worker_internal_ms = (await restored).t_ms;
+  r.restore_ms = performance.now() - t1;
+  await waitFor(() => frame, 10000);
+  r.first_frame_ms = performance.now() - t1;
+  r.total_to_first_frame_ms = performance.now() - t0;
+  const src0 = await fetch(`uploads/snap-${SNAP}-source.png`).then(x => x.blob()).then(createImageBitmap);
+  const c = new OffscreenCanvas(frame.w, frame.h).getContext("2d"); c.drawImage(src0, 0, 0);
+  const ref = c.getImageData(0, 0, frame.w, frame.h).data;
+  let d = 0; for (let k = 0; k < frame.w * frame.h; k++) d += ref[k * 4] !== frame.px[k * 4]; r.first_frame_diff_px = d;
+  log(i, `restore ${r.restore_ms.toFixed(1)} ms (worker ${r.worker_internal_ms.toFixed(1)}), first frame ${r.first_frame_ms.toFixed(1)} ms, diff ${d} px`);
+  if (i === 0) await shot(`${SNAP}-restored.png`);
+  await sleep(+(Q.get("wait") || 0));
+  await interact(r, ctrl, i, `${SNAP}-restored`);
+  w.terminate();
+  return r;
+}
+
+(async () => {
+  const [rom, disk] = await Promise.all([E.rom, E.disk].map(fetchBuf));
+  log(`emu=${EMU} mode=${MODE} build=${BUILD} n=${N}`);
+  for (let i = 0; i < N; i++) {
+    try {
+      let r;
+      if (MODE === "make") r = await make(rom, disk);
+      else if (MODE === "restore") r = await restore(i, rom, disk);
+      else { const b = await boot(i, rom, disk); r = b.r; if (i === 0) await shot(`${SNAP}-${BUILD}-desktop.png`); await interact(r, b.ctrl, i, `${SNAP}-${BUILD}`); b.w.terminate(); }
+      window.RESULTS.runs.push(r); log(i, JSON.stringify(r));
+    } catch (e) { log(i, "ERROR", e.message); window.RESULTS.runs.push({ error: e.message }); }
+    await sleep(500);
+  }
+  window.RESULTS.done = true; log("done");
+})();
+</script>

@@ -1,0 +1,16 @@
+node_modules/
+# Emulator builds, ROMs, disk images and snapshots are never committed.
+*.wasm
+*.rom
+*.dsk
+*.img
+*.bin
+*.bin.*
+*.zst
+prototype/web/out/
+prototype/web/bout/
+prototype/web/uploads/
+prototype/build/**/out/
+prototype/build/**/*.log
+prototype/build/**/minivmac/src/
+prototype/build/**/macemu/macemu/
