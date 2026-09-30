@@ -14,3 +14,8 @@ prototype/build/**/out/
 prototype/build/**/*.log
 prototype/build/**/minivmac/src/
 prototype/build/**/macemu/macemu/
+assets/
+dist/
+conformance/results/
+conformance/golden/
+uploads/

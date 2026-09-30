@@ -1,0 +1,53 @@
+{
+  "id": "sheepshaver-g3bw-macos904",
+  "name": "Power Macintosh G3 \u00b7 Mac OS 9.0.4",
+  "core": {
+    "adapter": "macemu",
+    "module": "../assets/cores/sheepshaver/sheepshaver.mjs",
+    "buildId": "sha256:6911886ee5edb18102e4b129a6e6d7b70f32c17191ed4a04f81d2dcb355e6c5a"
+  },
+  "machine": {
+    "name": "Power Macintosh G3 (Blue & White)",
+    "arch": "ppc",
+    "screen": {
+      "width": 640,
+      "height": 480
+    },
+    "memory": {
+      "default": 67108864,
+      "allowed": [
+        67108864
+      ]
+    },
+    "hardware": {
+      "pointerButtons": 1,
+      "wheel": false,
+      "keyboard": "adb-extended"
+    },
+    "files": {
+      "/rom": "../assets/roms/New-World.rom"
+    }
+  },
+  "disks": [
+    {
+      "id": "hd0",
+      "source": {
+        "manifest": "../assets/disks/macos904/manifest.json"
+      }
+    }
+  ],
+  "coreConfig": {
+    "flavor": "sheepshaver",
+    "keymap": "adb",
+    "args": [
+      "--config",
+      "/prefs"
+    ],
+    "guard": {
+      "cpu": "powerpc_cpu::execute(\\(|\\\\28)",
+      "forbid": "execute_sheep|idle_wait"
+    },
+    "prefs": "windowmodes 0\nscreenmodes 0\nframeskip 0\ngfxaccel false\nnocdrom true\nnonet true\nnosound true\nnogui true\nignoresegv true\nignoreillegal false\njit false\njit68k false\nkeyboardtype 5\nkeycodes false\nmousewheelmode 1\nidlewait true\nbootdrive 0\nbootdriver 0\nrom /rom\nramsize ${memory}\nscreen win/${width}/${height}\n${disks}\njsfrequentreadinput true\n",
+    "eventIntervalMs": 8
+  }
+}
