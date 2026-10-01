@@ -17,6 +17,7 @@ export const FLAG = {
   PAUSE: 1,
   SNAPSHOT: 2,
   OVERLAYS: 4,     // export disk overlays
+  DEBUG: 8,        // diagnostics: the adapter logs internal state once
 } as const;
 
 export const RING_SIZE = 256;          // events

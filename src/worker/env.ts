@@ -6,7 +6,9 @@ import type { Rect } from "../types";
 import { clock, realPerf } from "./clock";
 import type { BlockDevice } from "./disks";
 
-const FRAME_INTERVAL = 16;   // ms between frame posts
+// Minimum ms between frame posts. Below 16.7 on purpose: guests refresh at ~60 Hz with jitter, and a 16 ms floor
+// would push every slightly early frame to the next refresh (a dropped frame, felt as a stuttering cursor).
+const FRAME_INTERVAL = 12;
 const CLOCK_INTERVAL = 250;  // ms between clock heartbeats while no frames flow
 
 export type Discrete = { kind: "key"; code: number; down: boolean } | { kind: "button"; index: number; down: boolean }

@@ -61,7 +61,7 @@ export async function runMacemu(env: Env): Promise<void> {
     return out.buffer;
   }
 
-  let lastDiscrete = -Infinity;
+  let lastDiscrete = -Infinity, lastBlit = 0;
   function stageInput(): number {
     stage.fill(0); stage[ADDR.BUTTON] = -1;
     const now = performance.now();
@@ -100,10 +100,18 @@ export async function runMacemu(env: Env): Promise<void> {
     getInputValue: (addr: number) => stage[addr],
     releaseInputLock() {},
     sleep(sec: number) { env.flush(false); env.idle(sec * 1000); },
-    // Idle path: honour pause and overlay requests here too (not snapshots: this is not a safe point).
-    idleWait() { env.poll(true, false); env.idle(8); return env.hasInput() ? 1 : 0; },
+    // Idle path: honour pause and overlay requests here too (not snapshots: this is not a safe point). Only block
+    // until the next ~60 Hz refresh is due: SheepShaver checks its tick (which drives the refresh and the cursor)
+    // only every 50k instructions, so long idle blocks starve it (6 fps, 300 ms pointer lag).
+    idleWait() {
+      env.poll(true, false);
+      const wait = Math.min(8, lastBlit + 16.7 - performance.now() - 1);
+      if (wait > 0) env.idle(wait);
+      return env.hasInput() ? 1 : 0;
+    },
     didOpenVideo(w: number, h: number) { videoW = w; videoH = h; },
     blit(ptr: number, _size: number, rect?: { top: number; left: number; bottom: number; right: number }) {
+      lastBlit = performance.now();
       if (ptr) {
         if (ptr !== videoPtr || !env.width) { videoPtr = ptr; env.setSource(M.HEAPU8.subarray(ptr, ptr + videoW * videoH * 4), videoW, videoH, !!cfg.fixAlpha); }
         env.damage(rect ? { x: rect.left, y: rect.top, width: rect.right - rect.left, height: rect.bottom - rect.top } : undefined);

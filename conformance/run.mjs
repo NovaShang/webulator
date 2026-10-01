@@ -21,7 +21,7 @@ for (const id of profiles.length ? profiles : all) {
   const page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
   page.on("console", m => console.log(`[${id} +${((Date.now() - t0) / 1000).toFixed(0)}s]`, m.text()));
   page.on("pageerror", e => console.log(`[${id}] pageerror`, e.stack || e.message));
-  const q = new URLSearchParams({ profile: id, suite: opt("suite") ?? "conformance", tests: opt("tests") ?? "all", record: args.includes("--record") ? "1" : "", realclock: args.includes("--realclock") ? "1" : "", steps: opt("steps") ?? "" });
+  const q = new URLSearchParams({ profile: id, suite: opt("suite") ?? "conformance", tests: opt("tests") ?? "all", record: args.includes("--record") ? "1" : "", realclock: args.includes("--realclock") ? "1" : "", steps: opt("steps") ?? "", nopoll: opt("nopoll") ?? "" });
   await page.goto(`http://localhost:${PORT}/conformance/index.html?${q}`);
   await page.waitForFunction(() => window.RESULTS?.done, null, { timeout: 30 * 60_000, polling: 1000 });
   const res = await page.evaluate(() => window.RESULTS);

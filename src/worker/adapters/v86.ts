@@ -1,6 +1,7 @@
 // Adapter for v86 (spec §5.1, "native snapshot" kind). v86 schedules itself on the worker's event loop, so this
 // adapter polls the control block on a timer instead of from inside a blocking core loop.
 import type { Env, Discrete } from "../env";
+import { FLAG } from "../../control";
 import type { BlockDevice } from "../disks";
 import { KEY_CODES, PS2_SET1 } from "../../keyboard";
 import { HeadlessScreen } from "./v86screen";
@@ -22,7 +23,7 @@ function diskObject(dev: BlockDevice) {
     byteLength: dev.size,
     onload: null as null | ((e: unknown) => void), onprogress: null,
     load() { this.onload?.({}); },
-    get(start: number, len: number, cb: (d: Uint8Array) => void) { const d = read(start, len); queueMicrotask(() => cb(d)); },
+    get(start: number, len: number, cb: (d: Uint8Array) => void) { cb(read(start, len)); },
     set(start: number, data: Uint8Array, cb?: () => void) { dev.write(start, data); cb?.(); },
     get_and_cache(start: number, len: number, cb: (d: Uint8Array) => void) { cb(read(start, len)); },
     get_from_cache(start: number, len: number) { return read(start, len); },
@@ -71,9 +72,9 @@ export async function runV86(env: Env): Promise<void> {
     get: () => adapter,
     set: (v: object) => { adapter = Object.assign(v, screen.methods()); },
   });
-  screen.onResize = (w, h) => env.setSource(screen.fb, w, h, true);
+  screen.onResize = (w, h) => env.setSource(screen.fb, w, h);   // v86 layers are opaque already
   screen.onDamage = (x, y, w, h) => env.damage({ x, y, width: w, height: h });
-  env.setSource(screen.fb, screen.width, screen.height, true);
+  env.setSource(screen.fb, screen.width, screen.height);
   emu.add_listener("vmware-absolute-mouse", (on: boolean) => env.log(`vmware absolute mouse: ${on}`));
 
   await new Promise<void>(res => emu.add_listener("emulator-ready", () => res()));
@@ -108,6 +109,15 @@ export async function runV86(env: Env): Promise<void> {
   };
 
   const tick = () => {
+    if (env.flag(FLAG.DEBUG)) {
+      env.clearFlag(FLAG.DEBUG);
+      const cpu = emu.v86.cpu, ide = cpu.devices.ide?.primary?.master;
+      env.log("debug " + JSON.stringify({
+        eip: (cpu.instruction_pointer[0] >>> 0).toString(16), hlt: cpu.in_hlt[0], if: !!(cpu.get_eflags?.() & 0x200),
+        running, ide: ide && { status: ide.status_reg.toString(16), error: ide.error_reg, cmd: ide.current_command?.toString(16),
+          dma: ide.channel?.dma_status, lba: [ide.lba_high_reg, ide.lba_mid_reg, ide.lba_low_reg] },
+      }));
+    }
     const { snapshot } = env.poll(false);
     if (env.paused && running) { emu.stop(); running = false; }
     if (!env.paused && !running) { emu.run(); running = true; }
@@ -126,6 +136,8 @@ export async function runV86(env: Env): Promise<void> {
     }
     if (discrete) { lastDiscrete = now; sendDiscrete(discrete); }
 
+    // Keep ≥ 16 ms: rendering also drives v86's vertical-retrace bit, and Windows 98 hung at its boot logo in 3 of 8
+    // cold boots with a 14 ms threshold (0 of 8 at 16 ms). The cost is an occasional repeated frame.
     if (now - lastRender >= 16) { lastRender = now; render(); env.flush(false); }
 
     if (snapshot && !snapshotting) {
