@@ -11,6 +11,8 @@ for (const f of ["index.html", "demo.js", "coi-sw.js"]) copy(`demo/${f}`, f);
 copy("dist/webulator.js", "dist/webulator.js");
 copy("dist/webulator-worker.js", "dist/webulator-worker.js");
 fs.writeFileSync(path.join(OUT, ".nojekyll"), "");
+// Disk chunks are binary; never let git rewrite line endings in them (core.autocrlf would corrupt some).
+fs.writeFileSync(path.join(OUT, ".gitattributes"), "* -text\n");
 
 const used = new Set();
 for (const f of fs.readdirSync("profiles").filter(f => f.endsWith(".json"))) {
