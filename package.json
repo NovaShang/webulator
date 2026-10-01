@@ -1,0 +1,17 @@
+{
+  "name": "webulator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "serve": "node tools/serve.mjs",
+    "conformance": "node conformance/run.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "playwright": "^1.63.0",
+    "typescript": "^5.9.3",
+    "v86": "^0.5.462"
+  }
+}

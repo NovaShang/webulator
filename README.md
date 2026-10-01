@@ -6,10 +6,11 @@ Webulator wraps WebAssembly emulators — v86 (x86), Mini vMac, Basilisk II (68k
 start — behind a single browser API. Every core must pass the same conformance tests. The first user is
 OS Museum, a project that shows operating systems from every era side by side.
 
-**Status: design stage.** There is a v1 spec draft and a working prototype for the three Mac emulators. No package is
-published yet.
+**Status: v1 implemented, not yet published.** The v1 API runs four profiles (Mini vMac · System 6.0.8,
+Basilisk II · System 7.5.3, SheepShaver · Mac OS 9.0.4, v86 · Windows 98) and all of them pass the full conformance
+suite (`docs/conformance.md`).
 
-## What it will do
+## Usage
 
 ```ts
 const m = await Machine.create({
@@ -35,23 +36,36 @@ const state = await m.saveState();             // restore it later, in a fresh p
 
 ## What has been verified
 
-Measured in headless Chromium on an Apple M2 (details in `docs/findings/`):
+Headless Chromium 153 on an Apple M2, all eleven conformance tests per profile (details in `docs/conformance.md`):
 
-| Core | Guest | Snapshot, gzip | Restore to first frame | Speed cost | Source changes |
+| Profile | Cold boot | Snapshot (gzip) | Restore → first frame | First frame vs saved | Emulator source changes |
 |---|---|---|---|---|---|
-| Mini vMac | System 6.0.8 | 0.56 MB | ~0.1 s | none | none |
-| Basilisk II | System 7.5.3 | 2.0 MB | ~0.16 s | none | none |
-| SheepShaver | Mac OS 9.0.4 | 11.4 MB | ~0.5 s (worker: 60–80 ms) | ~15% | none |
-| v86 | Windows 98 | native `save_state` | ~40 ms in-process | — | not yet wired in |
+| Mini vMac · System 6.0.8 | 2.7 s | 0.57 MB | 46–85 ms | identical | none |
+| Basilisk II · System 7.5.3 | 4.0 s | 2.0 MB | 77–140 ms | identical | none |
+| SheepShaver · Mac OS 9.0.4 | 27.9 s | 11.1 MB | 158–217 ms | identical | none |
+| v86 · Windows 98 | 19.1 s | 12.4 MB | 137–170 ms | identical | none |
 
 ## Repository
 
 | Path | What |
 |---|---|
-| `docs/spec.md` | The v1 API spec (draft, currently in Chinese) |
+| `src/` | The library: `Machine` API (main thread), worker runtime, core adapters (`macemu`, `v86`) |
+| `profiles/` | The four verified profiles |
+| `conformance/` | The conformance suite (T1–T11), per-profile hooks, Playwright runner |
+| `tools/` | Build, dev server, disk chunking, build ids, overlay merge |
+| `docs/spec.md` | The v1 API spec (currently in Chinese) |
+| `docs/conformance.md` | Results, test method, profile preparation, known issues |
 | `docs/backends.md` | What each emulator offers and what it lacks |
 | `docs/findings/` | Measurement reports the spec is based on |
-| `prototype/` | The working prototype: shared worker runtime, test page, build scripts |
+| `prototype/` | The earlier spike code and the emulator build scripts |
+
+## Build and test
+
+```sh
+npm install
+npm run build            # dist/webulator.js + dist/webulator-worker.js
+npm run conformance      # needs cores, ROMs and disk images in assets/ (see profiles/*.json)
+```
 
 ## Licenses
 
