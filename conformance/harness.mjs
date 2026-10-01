@@ -126,18 +126,63 @@ async function explore() {
   await m.destroy();
 }
 
+// Pointer responsiveness: restore the desktop snapshot, then (a) sweep the pointer at 60 Hz for 3 s and count frames,
+// (b) jump 20 times and time until the cursor shows up at the target.
+async function latency() {
+  const snapUrl = `/uploads/${ID}/s0.webusnap`;
+  const m = await Machine.create({ profile, snapshot: { url: snapUrl } });
+  await waitFor(() => m.screen.seq > 0, 5000, 5);
+  await sleep(1500);
+  const c = hooks.cursor, a = c.area ?? { x: 100, y: 100, width: 300, height: 200 };
+  let frames = 0; const off = m.on("frame", () => frames++);
+  const t0 = performance.now();
+  while (performance.now() - t0 < 3000) {
+    const t = (performance.now() - t0) / 1000;
+    m.input.pointer.moveTo(a.x + a.width / 2 + Math.cos(t * 4) * a.width / 3, a.y + a.height / 2 + Math.sin(t * 4) * a.height / 3);
+    await new Promise(r => requestAnimationFrame(r));
+  }
+  off();
+  const sweepFps = frames / 3;
+  const lat = [];
+  for (let i = 0; i < 20; i++) {
+    const x = a.x + 30 + (i % 5) * (a.width - 60) / 4, y = a.y + 30 + Math.floor(i / 5) * (a.height - 60) / 3;
+    const win = { x: Math.round(x) - 20, y: Math.round(y) - 20, width: 44, height: 44 };
+    m.input.pointer.moveTo(c.park[0], c.park[1]); await sleep(150);
+    const base = await m.screen.read(win);
+    const ts = performance.now();
+    m.input.pointer.moveTo(x, y);
+    try { await waitChange(m, base, win, 3, 2000); lat.push(+(performance.now() - ts).toFixed(1)); } catch { lat.push(null); }
+  }
+  const ok = lat.filter(x => x !== null).sort((p, q) => p - q);
+  result("latency", true, { sweep_fps: +sweepFps.toFixed(1), jump_ms_median: ok[ok.length >> 1], jump_ms_p90: ok[Math.floor(ok.length * 0.9)], jump_ms: lat });
+  await m.destroy();
+}
+
 async function conformance() {
   const H = hooks;
   const bootTimeout = H.bootTimeout ?? 120000;
   const cold = () => Machine.create({ profile, clock: { start: FIXED_CLOCK } });
-  const ready = async m => { await waitFor(async () => H.ready(await m.screen.read()), bootTimeout, 100); await settle(m, H.settle ?? 2000, 60000); };
+  const ready = async m => {
+    if (Q.get("nopoll")) await sleep(+Q.get("nopoll"));   // diagnostic: do not touch the screen while booting
+    await waitFor(async () => H.ready(await m.screen.read()), bootTimeout, 100); await settle(m, H.settle ?? 2000, 60000);
+  };
 
   // T1 · cold boot
   let t = performance.now();
   const m = await cold();
   m.on("log", s => { if (!/^(PRAM|WARNING)/.test(s)) log("  core:", s); });
   try { await ready(m); result("T1", true, { boot_s: +((performance.now() - t) / 1000).toFixed(2) }); }
-  catch (e) { result("T1", false, { error: e.message }); await shot(m, "T1-fail"); await m.destroy(); return; }
+  catch (e) {
+    // Diagnostics: is the guest still reading the disk, and are frames still coming?
+    const dbg = []; const offLog = m.on("log", t => { if (t.startsWith("debug ")) dbg.push(t.slice(6)); });
+    for (let k = 0; k < 3; k++) { m._debug?.(); await sleep(500); }
+    offLog(); log("T1 debug:", dbg.join(" | "));
+    const acc = await m.disks.get(profile.disks[0].id).access();
+    let frames = 0; const off = m.on("frame", () => frames++); await sleep(3000); off();
+    const a2 = await m.disks.get(profile.disks[0].id).access();
+    result("T1", false, { error: e.message, disk_chunks: acc.chunkFetches, disk_chunks_3s_later: a2.chunkFetches, frames_in_3s: frames, screen: `${m.screen.width}x${m.screen.height}` });
+    await shot(m, "T1-fail"); await m.destroy(); return;
+  }
   await shot(m, "T1-ready");
 
   // Snapshot of the settled desktop, used by T2–T4, T7.
@@ -293,6 +338,6 @@ async function conformance() {
   result("T11", !!(tt.T1?.pass && tt.T2?.pass && tt.T3?.pass), { note: "T1–T3 ran with no display attached" });
 }
 
-try { if (SUITE === "smoke") await smoke(); else if (SUITE === "bake") await bake(); else if (SUITE === "explore") await explore(); else await conformance(); }
+try { if (SUITE === "smoke") await smoke(); else if (SUITE === "bake") await bake(); else if (SUITE === "explore") await explore(); else if (SUITE === "latency") await latency(); else await conformance(); }
 catch (e) { log("harness error", e.stack || e); window.RESULTS.error = String(e); }
 window.RESULTS.done = true; log("done");

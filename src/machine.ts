@@ -9,7 +9,10 @@ import { attachCanvas } from "./attach";
 type Listener<K extends keyof MachineEvents> = (e: MachineEvents[K]) => void;
 type Pending = { resolve: (v: any) => void; reject: (e: Error) => void };
 
-const WORKER_URL = new URL("./webulator-worker.js", import.meta.url);
+// "use-scheduling-api": v86 then yields with scheduler.postTask inside the worker instead of round-tripping through a
+// nested worker, whose delays (they grow when the page's main thread is busy) let guest time run on while the CPU
+// stood still; Windows 98's disk driver timed out and the boot hung or fell back to safe mode.
+const WORKER_URL = new URL("./webulator-worker.js?use-scheduling-api", import.meta.url);
 const STARTUP_TIMEOUT = 120_000;
 
 async function toBuffer(x: Blob | ArrayBuffer | { url: string }): Promise<ArrayBuffer> {
@@ -180,6 +183,9 @@ export class Machine {
     this.worker.terminate();
     this._state = "destroyed"; this.emit("state", "destroyed");
   }
+
+  /** Diagnostics (not part of the spec): ask the core adapter to log its internal state ("log" events). */
+  _debug(): void { this.alive(); Atomics.or(this.ctrl, CTRL.FLAGS, FLAG.DEBUG); wake(this.ctrl); }
 
   // ---------- screen ----------
   readonly screen = ((m: Machine) => ({
