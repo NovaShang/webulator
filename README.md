@@ -2,6 +2,8 @@
 
 One API for running old computers in the browser.
 
+**Live demo: https://novashang.github.io/webulator/** — Windows 98 (x86), System 6 and System 7.5 (68k), Mac OS 9 (PowerPC).
+
 Webulator wraps WebAssembly emulators — v86 (x86), Mini vMac, Basilisk II (68k Mac) and SheepShaver (PowerPC Mac) to
 start — behind a single browser API. Every core must pass the same conformance tests. The first user is
 OS Museum, a project that shows operating systems from every era side by side.
@@ -65,6 +67,7 @@ Headless Chromium 153 on an Apple M2, all eleven conformance tests per profile (
 npm install
 npm run build            # dist/webulator.js + dist/webulator-worker.js
 npm run conformance      # needs cores, ROMs and disk images in assets/ (see profiles/*.json)
+./tools/deploy-pages.sh  # build site/ and publish it to the gh-pages branch
 ```
 
 ## Licenses
