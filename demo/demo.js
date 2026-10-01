@@ -10,7 +10,7 @@ const DEFAULT = "basilisk2-quadra650-system753";
 
 const $ = id => document.getElementById(id);
 const canvas = $("screen"), veil = $("veil");
-let current = null, machine = null, saved = null, busy = false;
+let current = null, machine = null, saved = null, busy = false, pending = null;
 
 function status(text, state = "") { $("statusText").textContent = text; $("status").className = "status " + state; }
 function controls() {
@@ -53,7 +53,8 @@ async function teardown() {
 }
 
 async function start(fromSnapshot) {
-  if (!current || busy) return;
+  if (!current) return;
+  if (busy) { pending = fromSnapshot; return; }     // run it once the machine being started is up
   busy = true; controls();
   await teardown();
   veil.hidden = false; veil.textContent = fromSnapshot ? "Waking…" : "Booting…";
@@ -75,6 +76,7 @@ async function start(fromSnapshot) {
     status(e.message);
   }
   busy = false; controls();
+  if (pending !== null) { const p = pending; pending = null; start(p); }
 }
 
 function select(id, wake) {
