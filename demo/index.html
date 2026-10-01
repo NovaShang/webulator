@@ -7,10 +7,15 @@
 <meta name="description" content="Old computers running in your browser behind one API: Windows 98 on v86, System 6 and 7 on Mini vMac and Basilisk II, Mac OS 9 on SheepShaver.">
 <script>
   // Cross-origin isolation (for SharedArrayBuffer) comes from coi-sw.js on hosts that cannot set headers.
+  // Reload once the worker controls the page (controllerchange), not merely when registration resolves: the worker
+  // may not be active yet, and a reload before that leaves the page without the headers.
   if (!window.crossOriginIsolated && "serviceWorker" in navigator) {
-    navigator.serviceWorker.register("coi-sw.js").then(() => {
-      if (!sessionStorage.getItem("coi-reloaded")) { sessionStorage.setItem("coi-reloaded", "1"); location.reload(); }
-    });
+    navigator.serviceWorker.addEventListener("controllerchange", () => location.reload());
+    navigator.serviceWorker.register("coi-sw.js");
+    if (navigator.serviceWorker.controller && !sessionStorage.getItem("coi-reloaded")) {
+      // Controlled already (a returning visitor) but this response came from the network cache without headers.
+      sessionStorage.setItem("coi-reloaded", "1"); location.reload();
+    }
   }
 </script>
 <style>
