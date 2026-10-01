@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 const ROOT = path.resolve(process.argv[2] || ".");
 const PORT = +(process.argv[3] || 8766);
+const COI = !process.argv.includes("--no-coi");   // --no-coi imitates hosts like GitHub Pages
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
   ".wasm": "application/wasm", ".json": "application/json", ".css": "text/css" };
 http.createServer((req, res) => {
@@ -18,7 +19,7 @@ http.createServer((req, res) => {
   if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404); return res.end(); }
   const size = fs.statSync(file).size;
   const head = { "Content-Type": TYPES[path.extname(file)] || "application/octet-stream", "Accept-Ranges": "bytes",
-    "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp", "Cache-Control": "no-store" };
+    ...(COI ? { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp" } : {}), "Cache-Control": "no-store" };
   const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range || "");
   if (m) {
     const start = +m[1], end = m[2] ? +m[2] : size - 1;

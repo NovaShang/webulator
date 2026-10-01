@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webulator</title>
+<meta name="description" content="Old computers running in your browser behind one API: Windows 98 on v86, System 6 and 7 on Mini vMac and Basilisk II, Mac OS 9 on SheepShaver.">
+<script>
+  // Cross-origin isolation (for SharedArrayBuffer) comes from coi-sw.js on hosts that cannot set headers.
+  if (!window.crossOriginIsolated && "serviceWorker" in navigator) {
+    navigator.serviceWorker.register("coi-sw.js").then(() => {
+      if (!sessionStorage.getItem("coi-reloaded")) { sessionStorage.setItem("coi-reloaded", "1"); location.reload(); }
+    });
+  }
+</script>
+<style>
+  :root {
+    --ground: #070913; --ground-2: #0d1124; --glass: rgba(255,255,255,.055); --glass-edge: rgba(255,255,255,.11);
+    --text: #eceef7; --muted: #9aa0b8; --faint: #636a85; --accent: #e74dae; --accent-soft: rgba(231,77,174,.18);
+    --ok: #5fd39a; --warn: #f2b94b;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1200px 700px at 78% -10%, rgba(231,77,174,.14), transparent 60%),
+                radial-gradient(900px 600px at -10% 20%, rgba(76,92,255,.12), transparent 60%), var(--ground);
+    color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+    min-height: 100vh;
+    padding: 0 20px 64px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 28px 0 18px; }
+  .brand { font-weight: 750; font-size: 22px; letter-spacing: -.02em; }
+  .brand span { color: var(--accent); text-shadow: 0 0 18px rgba(231,77,174,.55); }
+  .tagline { color: var(--muted); }
+  header a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--glass-edge); }
+  header a:hover { color: var(--text); }
+
+  .layout { display: grid; grid-template-columns: 260px 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: var(--glass); border: 1px solid var(--glass-edge); border-radius: 16px; backdrop-filter: blur(18px); }
+
+  nav.machines { padding: 10px; display: grid; gap: 4px; }
+  .arch { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); padding: 12px 10px 4px; }
+  .machine { all: unset; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 10px 12px; border-radius: 10px; }
+  .machine:hover { background: rgba(255,255,255,.05); }
+  .machine:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .machine[aria-current="true"] { background: var(--accent-soft); box-shadow: inset 0 0 0 1px rgba(231,77,174,.45); }
+  .machine b { font-weight: 650; }
+  .machine .year { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .machine small { grid-column: 1 / -1; color: var(--muted); }
+
+  .stage { padding: 18px; display: grid; gap: 14px; }
+  .titlebar { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .titlebar h1 { margin: 0; font-size: 20px; letter-spacing: -.015em; text-wrap: balance; }
+  .titlebar .meta { color: var(--muted); font-size: 13px; }
+  .screen { display: grid; place-items: center; background: #000; border-radius: 10px; min-height: 360px; overflow: auto; position: relative; }
+  canvas { display: block; image-rendering: pixelated; max-width: 100%; height: auto; outline: none; }
+  canvas:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  .veil { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 14px; pointer-events: none; }
+  .veil[hidden] { display: none; }
+
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button.btn { font: inherit; font-size: 13.5px; color: var(--text); background: rgba(255,255,255,.07); border: 1px solid var(--glass-edge);
+    border-radius: 999px; padding: 7px 14px; cursor: pointer; }
+  button.btn:hover:not(:disabled) { background: rgba(255,255,255,.12); }
+  button.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.btn:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); border-color: transparent; color: #fff; box-shadow: 0 0 22px rgba(231,77,174,.45); }
+  button.primary:hover:not(:disabled) { background: #f05cba; }
+  .status { margin-left: auto; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--faint); vertical-align: 1px; }
+  .status.running .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .status.paused .dot { background: var(--warn); }
+  .hint { color: var(--faint); font-size: 12.5px; }
+
+  section.about { margin-top: 28px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  section.about .panel { padding: 18px 20px; }
+  section.about h2 { margin: 0 0 8px; font-size: 15px; }
+  section.about p, section.about li { color: var(--muted); font-size: 13.5px; }
+  section.about ul { margin: 0; padding-left: 18px; }
+  section.about a { color: var(--text); }
+  code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: #f3c6e4; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><span class="brand">Web<span>ulator</span></span> &nbsp;<span class="tagline">Old computers in your browser, behind one API.</span></div>
+    <a href="https://github.com/NovaShang/webulator">Source on GitHub</a>
+  </header>
+
+  <div class="layout">
+    <nav class="machines panel" id="machines" aria-label="Machines"></nav>
+
+    <main class="stage panel">
+      <div class="titlebar">
+        <h1 id="title">Choose a machine</h1>
+        <div class="meta" id="meta"></div>
+      </div>
+      <div class="screen">
+        <canvas id="screen" width="640" height="480" aria-label="Emulated screen. Click to use the mouse and keyboard."></canvas>
+        <div class="veil" id="veil">Pick a machine on the left.</div>
+      </div>
+      <div class="controls">
+        <button class="btn primary" id="wake">Wake from snapshot</button>
+        <button class="btn" id="boot">Cold boot</button>
+        <button class="btn" id="pause" disabled>Pause</button>
+        <button class="btn" id="save" disabled>Save state</button>
+        <button class="btn" id="restore" disabled>Restore saved</button>
+        <span class="status" id="status"><span class="dot"></span><span id="statusText">Idle</span></span>
+      </div>
+      <div class="hint">Click the screen to use the guest's mouse and keyboard. Each machine runs in its own worker; the guest clock stops while it is paused.</div>
+    </main>
+  </div>
+
+  <section class="about">
+    <div class="panel">
+      <h2>What is happening</h2>
+      <p>"Wake" downloads a saved state of a booted machine and restores it into a fresh WebAssembly emulator. The first frame is the exact screen the state was saved with. "Save state" captures the running machine, disk changes included; "Restore saved" brings it back in a new worker.</p>
+    </div>
+    <div class="panel">
+      <h2>Emulators</h2>
+      <ul>
+        <li><a href="https://github.com/copy/v86">v86</a> (BSD-2-Clause): x86, Windows 98</li>
+        <li><a href="https://github.com/mihaip/minivmac">Mini vMac</a> (GPL-2.0): Macintosh Plus</li>
+        <li><a href="https://github.com/mihaip/macemu">Basilisk II, SheepShaver</a> (GPL-2.0): Quadra 650, Power Macintosh G3</li>
+      </ul>
+      <p>Mac cores are Infinite Mac's builds with Asyncify enabled for snapshots; build scripts are in <code>prototype/build/</code>.</p>
+    </div>
+    <div class="panel">
+      <h2>Software</h2>
+      <p>Mac OS, its ROMs and Windows 98 belong to Apple and Microsoft. The disk images are the ones used by <a href="https://infinitemac.org">Infinite Mac</a> and the <a href="https://copy.sh/v86/">v86 demo</a>; the Windows image adds the open-source <a href="https://git.javispedro.com/cgit/vbados.git/about/">VBMOUSE</a> driver.</p>
+    </div>
+  </section>
+</div>
+
+<script type="module" src="demo.js"></script>
+</body>
+</html>
