@@ -20,18 +20,29 @@ function controls() {
   $("pause").textContent = machine?.state === "paused" ? "Resume" : "Pause";
 }
 
-// The machine list, grouped by architecture.
+// The machine tabs.
 const nav = $("machines");
-for (const arch of [...new Set(MACHINES.map(m => m.arch))]) {
-  const h = document.createElement("div"); h.className = "arch"; h.textContent = arch; nav.append(h);
-  for (const m of MACHINES.filter(x => x.arch === arch)) {
-    const b = document.createElement("button");
-    b.className = "machine"; b.dataset.id = m.id;
-    b.innerHTML = `<b>${m.os}</b><span class="year">${m.year}</span><small>${m.hw} · ${m.core}</small>`;
-    b.onclick = () => select(m.id, true);
-    nav.append(b);
-  }
+for (const m of MACHINES) {
+  const b = document.createElement("button");
+  b.className = "machine"; b.dataset.id = m.id;
+  b.innerHTML = `<b>${m.os}</b><small>${m.arch} · ${m.core}</small>`;
+  b.onclick = () => select(m.id, true);
+  nav.append(b);
 }
+
+// The call log: each library call this page makes, with its result.
+const calls = $("calls");
+function call(code) {
+  const li = document.createElement("li"), c = document.createElement("span"), r = document.createElement("span");
+  c.className = "c"; c.innerHTML = code; r.className = "r"; r.textContent = "…";
+  li.append(c, r); calls.append(li); calls.scrollTop = calls.scrollHeight;
+  return {
+    ok(text) { r.textContent = "→ " + text; r.className = "r ok"; },
+    fail(e) { r.textContent = "✕ " + (e?.message ?? e); r.className = "r err"; },
+  };
+}
+const ms = t0 => `${(performance.now() - t0).toFixed(0)} ms`;
+const mb = n => `${(n / 1048576).toFixed(1)} MB`;
 
 async function fetchWithProgress(url, label) {
   const res = await fetch(url);
@@ -48,7 +59,7 @@ async function fetchWithProgress(url, label) {
 }
 
 async function teardown() {
-  if (machine) { await machine.destroy(); machine = null; }
+  if (machine) { const c = call("<em>await</em> m.destroy()"); await machine.destroy(); c.ok("destroyed"); machine = null; }
   saved = null;
 }
 
@@ -56,34 +67,43 @@ async function start(fromSnapshot) {
   if (!current) return;
   if (busy) { pending = fromSnapshot; return; }     // run it once the machine being started is up
   busy = true; controls();
+  let c = { fail() {} };
   await teardown();
   veil.hidden = false; veil.textContent = fromSnapshot ? "Waking…" : "Booting…";
   try {
+    c = call(`profile = <em>await</em> loadProfile("${current.id}.json")`);
     const profile = await loadProfile(`profiles/${current.id}.json`);
+    c.ok(`${profile.core.adapter} · ${profile.machine.name}`);
     let snapshot;
-    if (fromSnapshot) snapshot = await fetchWithProgress(`snapshots/${current.id}.webusnap`, "Downloading saved state");
+    if (fromSnapshot) {
+      c = call(`snapshot = <em>await</em> fetch("${current.id}.webusnap")`);
+      snapshot = await fetchWithProgress(`snapshots/${current.id}.webusnap`, "Downloading saved state");
+      c.ok(mb(snapshot.size));
+    }
     status(fromSnapshot ? "Restoring…" : "Starting the emulator…");
+    c = call(`m = <em>await</em> Machine.create({ profile${fromSnapshot ? ", snapshot" : ""} })`);
     const t0 = performance.now();
     machine = await Machine.create({ profile, snapshot });
-    const ms = performance.now() - t0;
+    const took = ms(t0);
+    c.ok(`${machine.state} in ${took}`);
     machine.screen.attach(canvas, { input: true });
+    call("m.screen.attach(canvas, { input: <em>true</em> })").ok(`${machine.info.screen.width}×${machine.info.screen.height}, ${machine.info.arch}`);
     machine.on("state", s => { status(s === "paused" ? "Paused" : s === "crashed" ? "The emulator stopped" : "Running", s); controls(); });
     veil.hidden = true;
-    status(fromSnapshot ? `Running · restored in ${ms.toFixed(0)} ms` : "Running · booting", "running");
+    status(fromSnapshot ? `Running · restored in ${took}` : "Running · booting", "running");
     canvas.focus();
   } catch (e) {
     veil.hidden = false; veil.textContent = "Could not start this machine.";
-    status(e.message);
+    c.fail(e); status(e.message);
   }
   busy = false; controls();
   if (pending !== null) { const p = pending; pending = null; start(p); }
 }
 
 function select(id, wake) {
+  if (current?.id !== id) calls.replaceChildren();   // the log shows the calls for the machine on screen
   current = MACHINES.find(m => m.id === id);
   for (const b of nav.querySelectorAll(".machine")) b.setAttribute("aria-current", String(b.dataset.id === id));
-  $("title").textContent = `${current.os} on ${current.hw}`;
-  $("meta").textContent = `${current.arch} · ${current.core}`;
   history.replaceState(null, "", `#${id}`);
   controls();
   if (wake) start(true);
@@ -94,26 +114,32 @@ $("boot").onclick = () => start(false);
 $("pause").onclick = async () => {
   if (!machine) return;
   busy = true; controls();
-  if (machine.state === "paused") await machine.resume(); else await machine.pause();
+  const resume = machine.state === "paused", c = call(`<em>await</em> m.${resume ? "resume" : "pause"}()`), t0 = performance.now();
+  if (resume) await machine.resume(); else await machine.pause();
+  c.ok(`${machine.state} in ${ms(t0)}`);
   busy = false; controls();
 };
 $("save").onclick = async () => {
   busy = true; controls(); status("Saving…");
+  const c = call("saved = <em>await</em> m.saveState()");
   try {
     const t0 = performance.now();
     saved = await machine.saveState();
-    status(`Running · saved ${(saved.size / 1048576).toFixed(1)} MB in ${(performance.now() - t0).toFixed(0)} ms`, "running");
-  } catch (e) { status(e.message); }
+    c.ok(`${mb(saved.size)} in ${ms(t0)}`);
+    status(`Running · saved ${mb(saved.size)}`, "running");
+  } catch (e) { c.fail(e); status(e.message); }
   busy = false; controls();
 };
 $("restore").onclick = async () => {
   busy = true; controls(); status("Restoring…");
+  const c = call("<em>await</em> m.restoreState(saved)");
   try {
     const t0 = performance.now();
     await machine.restoreState(saved);
-    status(`Running · restored in ${(performance.now() - t0).toFixed(0)} ms`, "running");
+    c.ok(`restored in ${ms(t0)}`);
+    status(`Running · restored in ${ms(t0)}`, "running");
     canvas.focus();
-  } catch (e) { status(e.message); }
+  } catch (e) { c.fail(e); status(e.message); }
   busy = false; controls();
 };
 
