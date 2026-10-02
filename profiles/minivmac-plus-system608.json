@@ -1,0 +1,45 @@
+{
+  "id": "minivmac-plus-system608",
+  "name": "Macintosh Plus · System 6.0.8",
+  "core": {
+    "adapter": "macemu",
+    "module": "../assets/cores/minivmac/minivmac-plus.mjs",
+    "buildId": "sha256:4b1ee93f57cf0d35fe813953a0edda59444018f80929b5fbb524ca4970821dfe"
+  },
+  "machine": {
+    "name": "Macintosh Plus",
+    "arch": "m68k",
+    "screen": {
+      "width": 512,
+      "height": 342
+    },
+    "memory": {
+      "default": 4194304,
+      "allowed": [
+        4194304
+      ]
+    },
+    "hardware": {
+      "pointerButtons": 1,
+      "wheel": false,
+      "keyboard": "mac-plus"
+    },
+    "files": {
+      "/rom": "../assets/roms/Mac-Plus.rom"
+    }
+  },
+  "disks": [
+    {
+      "id": "hd0",
+      "source": {
+        "manifest": "https://pub-6986250a53034493aed2aee10422e09f.r2.dev/disks/minivmac-system608/manifest.json"
+      }
+    }
+  ],
+  "coreConfig": {
+    "flavor": "minivmac",
+    "keymap": "minivmac",
+    "fixAlpha": true,
+    "prefs": "rom /rom\n${disks}\nscreen win/${width}/${height}\n"
+  }
+}

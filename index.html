@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webulator</title>
+<meta name="description" content="One browser API for WebAssembly emulators: v86, Mini vMac, Basilisk II and SheepShaver behind the same contract, held to the same conformance tests.">
+<script>
+  // Cross-origin isolation (for SharedArrayBuffer) comes from coi-sw.js on hosts that cannot set headers.
+  // Reload once the worker controls the page (controllerchange), not merely when registration resolves: the worker
+  // may not be active yet, and a reload before that leaves the page without the headers.
+  if (!window.crossOriginIsolated && "serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("controllerchange", () => location.reload());
+    navigator.serviceWorker.register("coi-sw.js");
+    if (navigator.serviceWorker.controller && !sessionStorage.getItem("coi-reloaded")) {
+      // Controlled already (a returning visitor) but this response came from the network cache without headers.
+      sessionStorage.setItem("coi-reloaded", "1"); location.reload();
+    }
+  }
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" crossorigin>
+<style>
+  :root {
+    --bg: #f4f5f7; --surface: #ffffff; --sunken: #eceef2; --ink: #15171c; --muted: #5a6070; --faint: #808696;
+    --rule: #d8dbe2; --accent: #2445c2; --accent-ink: #ffffff; --pass: #137a48; --pass-bg: #e3f3ea; --warn: #a15c00;
+    --code-bg: #15171c; --code-rule: #262a33; --code-ink: #dfe3ec; --code-dim: #8a93a8; --code-key: #9fb4ff; --code-str: #9fd8b4;
+    --sans: "IBM Plex Sans", -apple-system, "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --surface: #161920; --sunken: #1c2029; --ink: #e7e9ee; --muted: #9ba1b0; --faint: #6c7282;
+      --rule: #2a2f3a; --accent: #8ea6ff; --accent-ink: #0f1115; --pass: #5cc68f; --pass-bg: #15291f; --warn: #e2a64a;
+      --code-bg: #0a0b0e; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115; --surface: #161920; --sunken: #1c2029; --ink: #e7e9ee; --muted: #9ba1b0; --faint: #6c7282;
+    --rule: #2a2f3a; --accent: #8ea6ff; --accent-ink: #0f1115; --pass: #5cc68f; --pass-bg: #15291f; --warn: #e2a64a;
+    --code-bg: #0a0b0e; color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--sans); padding: 0 20px 72px; }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  code { font: 13px var(--mono); }
+  h1, h2 { text-wrap: balance; font-weight: 600; letter-spacing: -.01em; }
+
+  /* Top bar */
+  .top { display: flex; align-items: center; gap: 20px; padding-block: 18px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+  .mark { font: 600 17px var(--mono); letter-spacing: -.02em; color: var(--ink); text-decoration: none; }
+  .top nav { display: flex; gap: 18px; margin-left: auto; font-size: 14px; flex-wrap: wrap; }
+  .top nav a { color: var(--muted); text-decoration: none; }
+  .top nav a:hover { color: var(--ink); }
+
+  /* Intro */
+  .intro { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px 48px; align-items: end; padding-block: 44px 28px; }
+  .intro h1 { margin: 0 0 12px; font-size: clamp(28px, 4vw, 40px); line-height: 1.15; max-width: 20ch; }
+  .intro p { margin: 0; color: var(--muted); max-width: 62ch; font-size: 16px; }
+  .facts { display: grid; grid-template-columns: repeat(3, auto); gap: 4px 28px; margin: 0; }
+  .facts div { display: flex; flex-direction: column-reverse; }
+  .facts dt { font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
+  .facts dd { margin: 0; font: 500 26px var(--mono); font-variant-numeric: tabular-nums; }
+  @media (max-width: 760px) { .intro { grid-template-columns: 1fr; } }
+
+  /* Demo */
+  .demo { display: grid; grid-template-columns: minmax(0, 1fr) 320px; border: 1px solid var(--rule); border-radius: 10px;
+    background: var(--surface); overflow: hidden; }
+  @media (max-width: 900px) { .demo { grid-template-columns: 1fr; } }
+  .stage { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+  .tabs { display: flex; overflow-x: auto; border-bottom: 1px solid var(--rule); }
+  .machine { all: unset; cursor: pointer; padding: 11px 16px 9px; display: grid; gap: 1px; border-right: 1px solid var(--rule);
+    border-bottom: 2px solid transparent; white-space: nowrap; }
+  .machine b { font-weight: 600; font-size: 14px; }
+  .machine small { font: 12px var(--mono); color: var(--faint); }
+  .machine:hover { background: var(--sunken); }
+  .machine:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .machine[aria-current="true"] { border-bottom-color: var(--accent); background: var(--sunken); }
+  .machine[aria-current="true"] small { color: var(--muted); }
+
+  .screen { display: grid; place-items: center; background: #000; min-height: 480px; overflow: auto; position: relative; }
+  canvas { display: block; image-rendering: pixelated; max-width: 100%; height: auto; outline: none; }
+  canvas:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  .veil[hidden] { display: none; }
+  .veil { position: absolute; inset: 0; display: grid; place-items: center; color: #9ba1b0; font: 13px var(--mono); pointer-events: none; }
+
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 12px 14px; border-top: 1px solid var(--rule); }
+  .btn { font: 500 13px var(--sans); color: var(--ink); background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+  .btn:hover:not(:disabled) { background: var(--sunken); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .btn.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+  .sep { width: 1px; align-self: stretch; background: var(--rule); margin-inline: 2px; }
+  .status { margin-left: auto; color: var(--muted); font: 12.5px var(--mono); font-variant-numeric: tabular-nums; }
+  .status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; background: var(--faint); vertical-align: 1px; }
+  .status.running .dot { background: var(--pass); }
+  .status.paused .dot { background: var(--warn); }
+
+  .calls { border-left: 1px solid var(--rule); background: var(--code-bg); color: var(--code-ink); display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto; min-height: 0;
+    contain: size; }   /* the screen sets the row height; the log scrolls inside it instead of growing it */
+  @media (max-width: 900px) { .calls { contain: none; border-left: 0; border-top: 1px solid var(--rule); height: 300px; } }
+  .calls h2 { margin: 0; padding: 12px 16px; font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .08em;
+    color: var(--code-dim); border-bottom: 1px solid var(--code-rule); }
+  .calls ol { list-style: none; margin: 0; padding: 8px 0; overflow-y: auto; font: 12.5px/1.55 var(--mono); }
+  .calls li { padding: 5px 16px; display: grid; gap: 1px; }
+  .calls .c { white-space: pre-wrap; word-break: break-word; }
+  .calls .c em { font-style: normal; color: var(--code-key); }
+  .calls .r { color: var(--code-dim); }
+  .calls .r.ok { color: var(--code-str); }
+  .calls .r.err { color: #ff9b9b; }
+  .calls .note { margin: 0; padding: 10px 16px 14px; font-size: 12px; color: var(--code-dim); border-top: 1px solid var(--code-rule); }
+
+  /* Sections */
+  section { padding-top: 60px; }
+  section > h2 { font-size: 22px; margin: 0 0 6px; }
+  section > .lede { color: var(--muted); margin: 0 0 22px; max-width: 66ch; }
+  .split { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 36px; align-items: start; }
+  @media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+  pre.code { margin: 0; background: var(--code-bg); color: var(--code-ink); border-radius: 10px; padding: 18px 20px;
+    font: 13px/1.65 var(--mono); overflow-x: auto; }
+  pre.code .k { color: var(--code-key); }
+  pre.code .s { color: var(--code-str); }
+  pre.code .d { color: var(--code-dim); }
+  dl.rules { margin: 0; display: grid; gap: 18px; }
+  dl.rules dt { font-weight: 600; }
+  dl.rules dd { margin: 2px 0 0; color: var(--muted); }
+
+  .table { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  thead th { font: 500 11.5px var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    background: var(--sunken); white-space: nowrap; }
+  thead th small { display: block; text-transform: none; letter-spacing: 0; color: var(--faint); font-size: 11.5px; }
+  td.id { font: 500 13px var(--mono); color: var(--faint); width: 3.5em; }
+  td.num { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.t { min-width: 22ch; }
+  .pass { display: inline-flex; align-items: center; gap: 7px; font: 12.5px var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .pass::before { content: "PASS"; font-weight: 600; font-size: 10.5px; letter-spacing: .04em; color: var(--pass);
+    background: var(--pass-bg); padding: 1px 6px; border-radius: 4px; }
+  .muted { color: var(--muted); }
+  .table-note { color: var(--faint); font-size: 13px; margin: 10px 0 0; }
+
+  footer { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 13.5px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px 40px; }
+  footer p { margin: 0; max-width: 62ch; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="mark" href="./">webulator</a>
+    <nav aria-label="Project">
+      <a href="#api">API</a>
+      <a href="#conformance">Conformance</a>
+      <a href="#cores">Cores</a>
+      <a href="https://github.com/NovaShang/webulator">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="intro">
+    <div>
+      <h1>One browser API for emulated computers</h1>
+      <p>Webulator runs WebAssembly emulators in a worker and puts them behind one contract: snapshots, exact pointer
+        input, a virtual clock and copy-on-write disks. A core counts as supported only when it passes the same twelve
+        conformance tests as every other core.</p>
+    </div>
+    <dl class="facts">
+      <div><dt>cores</dt><dd>4</dd></div>
+      <div><dt>CPU families</dt><dd>3</dd></div>
+      <div><dt>tests passed</dt><dd>48/48</dd></div>
+    </dl>
+  </div>
+
+  <div class="demo">
+    <div class="stage">
+      <nav class="tabs" id="machines" aria-label="Machines"></nav>
+      <div class="screen">
+        <canvas id="screen" width="640" height="480" aria-label="Emulated screen. Click to use the mouse and keyboard."></canvas>
+        <div class="veil" id="veil">Choose a machine.</div>
+      </div>
+      <div class="controls">
+        <button class="btn primary" id="wake">Restore snapshot</button>
+        <button class="btn" id="boot">Boot from disk</button>
+        <span class="sep" aria-hidden="true"></span>
+        <button class="btn" id="pause" disabled>Pause</button>
+        <button class="btn" id="save" disabled>Save state</button>
+        <button class="btn" id="restore" disabled>Restore saved</button>
+        <span class="status" id="status"><span class="dot"></span><span id="statusText">Idle</span></span>
+      </div>
+    </div>
+    <aside class="calls" aria-label="API calls made by this demo">
+      <h2>Calls made by this page</h2>
+      <ol id="calls"></ol>
+      <p class="note">Click the screen to send mouse and keyboard input to the guest.</p>
+    </aside>
+  </div>
+
+  <section id="api">
+    <h2>The API</h2>
+    <p class="lede">A profile names the core, the machine model and the disk images. Everything after
+      <code>Machine.create</code> is the same for every core.</p>
+    <div class="split">
+<pre class="code"><span class="k">import</span> { Machine, loadProfile } <span class="k">from</span> <span class="s">"webulator"</span>;
+
+<span class="k">const</span> m = <span class="k">await</span> Machine.create({
+  profile: <span class="k">await</span> loadProfile(<span class="s">"sheepshaver-g3bw-macos904.json"</span>),
+  snapshot: { url: <span class="s">"finder.webusnap"</span> },   <span class="d">// skip the boot</span>
+  display: canvas,
+});
+
+m.input.pointer.moveTo(<span class="s">20</span>, <span class="s">8</span>);    <span class="d">// guest pixels, lands exactly</span>
+m.input.pointer.button(<span class="s">0</span>, <span class="k">true</span>);
+<span class="k">await</span> m.input.type(<span class="s">"Hello"</span>);
+
+<span class="k">await</span> m.pause();                   <span class="d">// the guest clock stops too</span>
+<span class="k">const</span> state = <span class="k">await</span> m.saveState();   <span class="d">// CPU, RAM, devices, disk writes</span>
+<span class="k">const</span> writes = <span class="k">await</span> m.disks.get(<span class="s">"hd0"</span>).exportOverlay();</pre>
+      <dl class="rules">
+        <div><dt>Equal capabilities, nothing optional</dt>
+          <dd>A capability enters the contract only once every core implements it and passes its tests. Hardware
+            differences such as screen sizes and mouse buttons are reported as properties.</dd></div>
+        <div><dt>Snapshots restore to the same pixel</dt>
+          <dd>A saved state restores into a fresh worker, and its first frame matches the saved frame exactly.</dd></div>
+        <div><dt>A virtual clock</dt>
+          <dd>The guest sees no time pass while it is paused or stored, so a restored machine behaves like one that
+            never stopped.</dd></div>
+        <div><dt>Disk fetches never stall the guest</dt>
+          <dd>Disk images load lazily over the network. While a chunk is on its way the guest keeps running, so the
+            cursor keeps moving, as on a real machine with a busy disk.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section id="conformance">
+    <h2>Conformance</h2>
+    <p class="lede">Every profile runs the full suite in headless Chromium. These results are from Chromium 153 on an Apple M2.</p>
+    <div class="table">
+      <table>
+        <thead>
+          <tr><th></th><th>Test</th>
+            <th>Mini vMac<small>System 6.0.8</small></th><th>Basilisk II<small>System 7.5.3</small></th>
+            <th>SheepShaver<small>Mac OS 9.0.4</small></th><th>v86<small>Windows 98</small></th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="id">T1</td><td class="t">Cold boot to a settled desktop</td><td><span class="pass">2.7 s</span></td><td><span class="pass">4.0 s</span></td><td><span class="pass">27.9 s</span></td><td><span class="pass">19.1 s</span></td></tr>
+          <tr><td class="id">T2</td><td class="t">Save, destroy, restore into a new worker; first frame identical, 5 times</td><td><span class="pass">46–85 ms</span></td><td><span class="pass">77–140 ms</span></td><td><span class="pass">158–217 ms</span></td><td><span class="pass">137–170 ms</span></td></tr>
+          <tr><td class="id">T3</td><td class="t">Responsive after restore: a menu opens, an app opens</td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td></tr>
+          <tr><td class="id">T4</td><td class="t">Restored after a 60 s gap, responds like a fresh restore</td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td></tr>
+          <tr><td class="id">T5</td><td class="t">Paused 10 s: guest clock advance, frames drawn</td><td><span class="pass">0 ms, 0</span></td><td><span class="pass">0 ms, 0</span></td><td><span class="pass">0 ms, 0</span></td><td><span class="pass">0 ms, 0</span></td></tr>
+          <tr><td class="id">T6</td><td class="t"><code>moveTo</code> 20 random points; cursor lands exactly</td><td><span class="pass">20/20</span></td><td><span class="pass">20/20</span></td><td><span class="pass">20/20</span></td><td><span class="pass">20/20</span></td></tr>
+          <tr><td class="id">T7</td><td class="t"><code>type()</code> all 95 printable ASCII characters, compared with a golden image</td><td><span class="pass">0 px</span></td><td><span class="pass">0 px</span></td><td><span class="pass">0 px</span></td><td><span class="pass">0 px</span></td></tr>
+          <tr><td class="id">T8</td><td class="t">Disk overlay exported and booted in a new machine</td><td><span class="pass">16 KB</span></td><td><span class="pass">80 KB</span></td><td><span class="pass">192 KB</span></td><td><span class="pass">2.9 MB</span></td></tr>
+          <tr><td class="id">T9</td><td class="t">Snapshot taken while the guest is busy booting, then restored</td><td><span class="pass">164 ms</span></td><td><span class="pass">269 ms</span></td><td><span class="pass">497 ms</span></td><td><span class="pass">270 ms</span></td></tr>
+          <tr><td class="id">T10</td><td class="t">No input lost: about 380 key events sent back to back</td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td></tr>
+          <tr><td class="id">T11</td><td class="t">T1 to T3 with no display attached</td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td></tr>
+          <tr><td class="id">T12</td><td class="t">Disk fetches delayed 400 ms each: longest pause in the moving cursor</td><td><span class="pass">33 ms</span></td><td><span class="pass">37 ms</span></td><td><span class="pass">59 ms</span></td><td><span class="pass">36 ms</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note">Method, golden images and known issues are in <a href="https://github.com/NovaShang/webulator/blob/main/docs/conformance.md">docs/conformance.md</a>.</p>
+  </section>
+
+  <section id="cores">
+    <h2>Cores</h2>
+    <p class="lede">Each core keeps its own license and ships separately from the MIT-licensed library.</p>
+    <div class="table">
+      <table>
+        <thead><tr><th>Core</th><th>CPU</th><th>Machine in the demo</th><th>Snapshot</th><th>License</th><th>Source changes</th></tr></thead>
+        <tbody>
+          <tr><td><a href="https://github.com/copy/v86">v86</a></td><td>x86</td><td>PC · Windows 98</td><td class="num">12.4 MB</td><td>BSD-2-Clause</td><td class="muted">none</td></tr>
+          <tr><td><a href="https://github.com/mihaip/minivmac">Mini vMac</a></td><td>68000</td><td>Macintosh Plus · System 6.0.8</td><td class="num">0.6 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
+          <tr><td><a href="https://github.com/mihaip/macemu">Basilisk II</a></td><td>68040</td><td>Quadra 650 · System 7.5.3</td><td class="num">2.0 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
+          <tr><td><a href="https://github.com/mihaip/macemu">SheepShaver</a></td><td>PowerPC</td><td>Power Macintosh G3 · Mac OS 9.0.4</td><td class="num">11.1 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note">Snapshot sizes are gzip-compressed. The Mac cores are Infinite Mac's builds, rebuilt with Asyncify
+      enabled and one small patch: the disk driver reports "busy" instead of blocking while data is fetched.</p>
+  </section>
+
+  <footer>
+    <p>Webulator is MIT-licensed and not yet published to npm. Build it from <a href="https://github.com/NovaShang/webulator">the repository</a>.</p>
+    <p>Mac OS, its ROMs and Windows 98 belong to Apple and Microsoft. The demo uses the disk images from
+      <a href="https://infinitemac.org">Infinite Mac</a> and the <a href="https://copy.sh/v86/">v86 demo</a>; the
+      Windows image adds the open-source <a href="https://git.javispedro.com/cgit/vbados.git/about/">VBMOUSE</a> driver.</p>
+  </footer>
+</div>
+
+<script type="module" src="demo.js"></script>
+</body>
+</html>

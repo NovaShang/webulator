@@ -1,0 +1,53 @@
+{
+  "id": "basilisk2-quadra650-system753",
+  "name": "Quadra 650 · System 7.5.3",
+  "core": {
+    "adapter": "macemu",
+    "module": "../assets/cores/basilisk2/basilisk2.mjs",
+    "buildId": "sha256:1c2e59cfe1696fe6be657e58486200815abbd81d9abf91257e3d711e6805ef8f"
+  },
+  "machine": {
+    "name": "Quadra 650",
+    "arch": "m68k",
+    "screen": {
+      "width": 640,
+      "height": 480
+    },
+    "memory": {
+      "default": 33554432,
+      "allowed": [
+        33554432
+      ]
+    },
+    "hardware": {
+      "pointerButtons": 1,
+      "wheel": false,
+      "keyboard": "adb-extended"
+    },
+    "files": {
+      "/rom": "../assets/roms/Quadra-650.rom"
+    }
+  },
+  "disks": [
+    {
+      "id": "hd0",
+      "source": {
+        "manifest": "https://pub-6986250a53034493aed2aee10422e09f.r2.dev/disks/system753/manifest.json"
+      }
+    }
+  ],
+  "coreConfig": {
+    "flavor": "basilisk",
+    "keymap": "adb",
+    "args": [
+      "--config",
+      "/prefs"
+    ],
+    "guard": {
+      "cpu": "m68k_execute",
+      "forbid": "idle_wait"
+    },
+    "prefs": "frameskip 0\nfpu true\nnocdrom true\nnosound true\nnogui true\njit false\nkeyboardtype 5\nkeycodes false\nmousewheelmode 1\nidlewait true\nbootdrive 0\nbootdriver 0\nrom /rom\ncpu 4\nmodelid 30\nramsize ${memory}\nscreen win/${width}/${height}\n${disks}\njsfrequentreadinput true\n",
+    "eventIntervalMs": 8
+  }
+}
