@@ -1,0 +1,93 @@
+--- a/src/OSGLUAAA.h
++++ b/src/OSGLUAAA.h
+@@ -139,6 +139,7 @@
+ 	tDrive Drive_No, ui5r Sony_Start, ui5r Sony_Count,
+ 	ui5r *Sony_ActCount);
+ EXPORTOSGLUFUNC tMacErr vSonyEject(tDrive Drive_No);
++EXPORTOSGLUFUNC blnr vSonyReady(tDrive Drive_No, ui5r Sony_Start, ui5r Sony_Count);
+ EXPORTOSGLUFUNC tMacErr vSonyGetSize(tDrive Drive_No, ui5r *Sony_Count);
+ 
+ EXPORTOSGLUFUNC blnr AnyDiskInserted(void);
+--- a/src/OSGLUESC.c
++++ b/src/OSGLUESC.c
+@@ -264,6 +264,19 @@
+ 	}
+ }
+ 
++/*
++	Whether a transfer can run without waiting for its data. A disk that
++	fetches lazily starts the fetch and says no; Sony_Prime then reports
++	busy and the driver retries, so the guest keeps running meanwhile.
++*/
++GLOBALOSGLUFUNC blnr vSonyReady(tDrive Drive_No, ui5r Sony_Start,
++	ui5r Sony_Count)
++{
++	return EM_ASM_INT({
++		return workerApi.disks.ready ? workerApi.disks.ready($0, $1, $2) : 1;
++	}, Drives[Drive_No], Sony_Start, Sony_Count) != 0;
++}
++
+ GLOBALOSGLUFUNC tMacErr vSonyTransfer(blnr IsWrite, ui3p Buffer,
+ 	tDrive Drive_No, ui5r Sony_Start, ui5r Sony_Count,
+ 	ui5r *Sony_ActCount)
+--- a/src/SONYEMDV.c
++++ b/src/SONYEMDV.c
+@@ -1277,6 +1277,16 @@
+ 			result = mnvm_wPrErr;
+ 		} else {
+ 			CPTR Buffera = get_vm_long(ParamBlk + kioBuffer);
++			if (! vSonyReady(Drive_No,
++				ImageDataOffset[Drive_No] + Sony_Start, Sony_Count))
++			{
++				/*
++					Data not fetched yet: busy. The driver's Prime
++					retries while the result is 1; nothing in the
++					parameter block changes until then.
++				*/
++				return 1;
++			}
+ 			result = Drive_Transfer(IsWrite, Buffera, Drive_No,
+ 					Sony_Start, Sony_Count, &Sony_ActCount);
+ #if Sony_SupportTags
+--- a/src/ROMEMDEV.c
++++ b/src/ROMEMDEV.c
+@@ -220,7 +220,39 @@
+ 	pto += 2;
+ 	do_put_mem_long(pto, kExtn_Block_Base); /* pokeaddr */
+ 	pto += 4;
++
++	/*
++		Prime with retry, placed after the call block so nothing in
++		sony_driver moves. Sony_Prime returns 1 while the data is still
++		being fetched; the loop calls it again, taking interrupts in
++		between (the cursor keeps moving). The original Prime entry
++		branches here.
++	*/
++	{
++		LOCALVAR const ui3b prime_retry[] = {
++			0x48, 0xE7, 0x00, 0xC0, /* movem.l a0-a1,-(sp) */
++			0x55, 0x4F,             /* subq.w #2,sp */
++			0x3F, 0x3C, 0x00, 0x01, /* move.w #kCmndSonyPrime,-(sp) */
++			0x41, 0xFA, 0xFF, 0xEC, /* lea callblock(pc),a0 */
++			0x2F, 0x18,             /* move.l (a0)+,-(sp) */
++			0x20, 0x50,             /* movea.l (a0),a0 */
++			0x20, 0x8F,             /* move.l sp,(a0) */
++			0x5C, 0x4F,             /* addq.w #6,sp */
++			0x30, 0x1F,             /* move.w (sp)+,d0 */
++			0x4C, 0xDF, 0x03, 0x00, /* movem.l (sp)+,a0-a1 */
++			0x0C, 0x40, 0x00, 0x01, /* cmpi.w #1,d0 */
++			0x67, 0xDE,             /* beq.s prime_retry */
++			0x60, 0x00, 0xFE, 0x66  /* bra.w IOReturn (driver + 0x66) */
++		};
++		ui3p drv = Sony_DriverBase + ROM;
+ 
++		MyMoveBytes((anyp)prime_retry, (anyp)pto, sizeof(prime_retry));
++		/* Prime (driver + 0x18): bra.w prime_retry */
++		do_put_mem_word(drv + 0x18, 0x6000);
++		do_put_mem_word(drv + 0x1A, (pto - drv) - 0x1A);
++		pto += sizeof(prime_retry);
++	}
++
+ 	my_disk_icon_addr = (pto - ROM) + kROM_Base;
+ 	MyMoveBytes((anyp)my_disk_icon, (anyp)pto, sizeof(my_disk_icon));
+ 	pto += sizeof(my_disk_icon);

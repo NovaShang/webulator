@@ -245,7 +245,8 @@ async function conformance() {
       const ov = await m.disks.get(profile.disks[0].id).exportOverlay();
       const m2 = await Machine.create({ profile, clock: { start: FIXED_CLOCK }, disks: [{ ...profile.disks[0], overlay: ov }] });
       if (H.afterUncleanBoot && !H.shutdown) await H.afterUncleanBoot(m2, { waitChange, click, sleep, settle, shot: n => shot(m2, n) });
-      await ready(m2);
+      try { await ready(m2); }
+      catch (e) { await shot(m2, "T8-fail"); m2._debug(); await sleep(500); throw e; }
       const ov2 = await m2.disks.get(profile.disks[0].id).exportOverlay();
       await m2.destroy();
       result("T8", ov.size > 8 && ov2.size >= ov.size, { overlay_kb: +(ov.size / 1024).toFixed(1), after_reboot_kb: +(ov2.size / 1024).toFixed(1) });
@@ -330,6 +331,57 @@ async function conformance() {
       const ok = baseline ? Object.keys(timings).every(k => timings[k] <= Math.max(2 * baseline[k], baseline[k] + 50)) : true;
       result("T4", ok, { gap_s: +((performance.now() - tSave) / 1000).toFixed(0), timings, baseline });
     } catch (e) { result("T4", false, { error: e.message }); }
+  }
+
+  // T12 · disk fetches do not stall the guest. Restore with every disk fetch delayed by 400 ms (and a cold cache),
+  // keep the pointer moving at 60 Hz, and run the profile's diskLoad (default: open the T7 app), which reads the disk. A guest that blocks on a fetch
+  // stops drawing the moving cursor for ≥ 400 ms; one that keeps running draws it every frame or two.
+  // The sweep steps aside while the hook uses the pointer (it may be dragging through a menu), and only gaps that
+  // fall entirely inside sweeping time count.
+  if (want("T12")) {
+    try {
+      const LATENCY = 400;
+      const r = await Machine.create({ profile, snapshot: s0, debug: { diskLatencyMs: LATENCY } });
+      await waitFor(() => r.screen.seq > 0, 5000, 5);
+      const disk = r.disks.get(profile.disks[0].id), fetched0 = (await disk.access()).chunkFetches;
+      const a = hooks.cursor.area ?? { x: 100, y: 100, width: 300, height: 200 };
+      const moveTo = r.input.pointer.moveTo, button = r.input.pointer.button;
+      let hookUntil = 0, held = 0;
+      // Waiting for the screen to change or settle needs a still pointer: hold the sweep meanwhile.
+      const still = f => async (...args) => { held++; try { return await f(...args); } finally { held--; hookUntil = performance.now() + 300; } };
+      r.input.pointer.moveTo = (x, y) => { hookUntil = performance.now() + 300; moveTo(x, y); };
+      r.input.pointer.button = (i, down) => { held += down ? 1 : -1; hookUntil = performance.now() + 300; button(i, down); };
+      const frames = [], sweeping = []; let sweepFrom = null, running = true;
+      const off = r.on("frame", () => frames.push(performance.now()));
+      const sweep = (async () => {
+        const t0 = performance.now();
+        while (running) {
+          const now = performance.now(), on = held === 0 && now >= hookUntil;
+          if (on && sweepFrom === null) sweepFrom = now;
+          if (!on && sweepFrom !== null) { sweeping.push([sweepFrom, now]); sweepFrom = null; }
+          if (on) { const t = (now - t0) / 1000; moveTo(a.x + a.width / 2 + Math.cos(t * 4) * a.width / 3, a.y + a.height / 2 + Math.sin(t * 4) * a.height / 3); }
+          await new Promise(res => requestAnimationFrame(res));
+        }
+        if (sweepFrom !== null) sweeping.push([sweepFrom, performance.now()]);
+      })();
+      await sleep(1000);
+      await (H.diskLoad ?? H.textEcho.open)(r, { waitChange: still(waitChange), click, sleep, settle: still(settle), shot: n => shot(r, n) });
+      await sleep(1000);
+      running = false; await sweep; off();
+      r.input.pointer.moveTo = moveTo; r.input.pointer.button = button;
+      const fetched = (await disk.access()).chunkFetches - fetched0;
+      const inSweep = (s, e) => sweeping.some(([a0, a1]) => s >= a0 && e <= a1);
+      const gaps = [];
+      for (let i = 1; i < frames.length; i++) if (inSweep(frames[i - 1], frames[i])) gaps.push(frames[i] - frames[i - 1]);
+      gaps.sort((p, q) => p - q);
+      const max = gaps.length ? gaps[gaps.length - 1] : Infinity, sweptMs = sweeping.reduce((s, [a0, a1]) => s + a1 - a0, 0);
+      await shot(r, "T12-after");
+      result("T12", fetched >= 3 && max < LATENCY / 2, {
+        latency_ms: LATENCY, fetches: fetched, swept_ms: Math.round(sweptMs), frames: gaps.length + 1,
+        gap_ms_p50: +(gaps[gaps.length >> 1] ?? 0).toFixed(0), gap_ms_p99: +(gaps[Math.floor(gaps.length * 0.99)] ?? 0).toFixed(0), gap_ms_max: +max.toFixed(0),
+      });
+      await r.destroy();
+    } catch (e) { result("T12", false, { error: e.message }); }
   }
 
   // T11 · everything above ran headless (no canvas attached)

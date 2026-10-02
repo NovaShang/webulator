@@ -2,7 +2,7 @@
 import "./clock";
 import { clock } from "./clock";
 import type { InitMsg, WorkerMsg } from "../protocol";
-import { BlockDevice } from "./disks";
+import { BlockDevice, startFetcher } from "./disks";
 import { Env } from "./env";
 import { runMacemu } from "./adapters/macemu";
 import { runV86 } from "./adapters/v86";
@@ -22,6 +22,7 @@ self.onmessage = async ({ data }: MessageEvent<InitMsg>) => {
   if (data.type !== "init") return;
   let stage = "assets";
   try {
+    startFetcher(data.ctrl, data.diskLatencyMs);
     const disks = new Map<string, BlockDevice>();
     for (const d of data.disks) disks.set(d.id, await BlockDevice.open(d));
     const files = new Map<string, Uint8Array>();

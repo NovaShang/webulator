@@ -4,7 +4,7 @@
   "core": {
     "adapter": "macemu",
     "module": "../assets/cores/sheepshaver/sheepshaver.mjs",
-    "buildId": "sha256:6911886ee5edb18102e4b129a6e6d7b70f32c17191ed4a04f81d2dcb355e6c5a"
+    "buildId": "sha256:5122f1c6a7393f308b6e93a5fa8bdc9467fe9d105c98d444b402de2017f62640"
   },
   "machine": {
     "name": "Power Macintosh G3 (Blue & White)",

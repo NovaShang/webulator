@@ -22,6 +22,7 @@ export type InitMsg = {
   memory: number;
   disks: WorkerDisk[];
   clockStart?: number;
+  diskLatencyMs?: number;
   restore?: { core: ArrayBuffer; clock: GuestClock };
 };
 

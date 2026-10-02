@@ -46,3 +46,16 @@ export function shutdownVia(special, item) {
     m.input.pointer.button(0, false);
   };
 }
+
+/** T12 workload: launch Apple menu items one after another (each reads its code and resources from disk). */
+export function launchFromAppleMenu(...ys) {
+  return async (m, h) => {
+    for (const y of ys) {
+      m.input.pointer.moveTo(20, 8); await h.sleep(60);
+      m.input.pointer.button(0, true); await h.sleep(400);
+      m.input.pointer.moveTo(60, y); await h.sleep(300);
+      m.input.pointer.button(0, false);
+      await h.sleep(2500);
+    }
+  };
+}

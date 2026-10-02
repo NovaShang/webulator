@@ -1,8 +1,9 @@
 # Conformance results
 
-Run on 2026-09-30 · Apple M2 · headless Chromium 153 (Playwright 1.63) · `node conformance/run.mjs`
+Run on 2026-09-30 (T1–T11) and 2026-10-02 (T12, and T1–T11 again with the patched Mac cores) · Apple M2 ·
+headless Chromium 153 (Playwright 1.63) · `node conformance/run.mjs`
 
-**All four profiles pass all eleven tests.**
+**All four profiles pass all twelve tests.**
 
 | Test | What it checks | Mini vMac · System 6.0.8 | Basilisk II · System 7.5.3 | SheepShaver · Mac OS 9.0.4 | v86 · Windows 98 |
 |---|---|---|---|---|---|
@@ -17,6 +18,7 @@ Run on 2026-09-30 · Apple M2 · headless Chromium 153 (Playwright 1.63) · `nod
 | T9 | Snapshot requested while the guest is busy booting, then restored | PASS · 164 ms | PASS · 269 ms | PASS · 497 ms | PASS · 270 ms |
 | T10 | No input lost (the ~380 key events of T7 sent back to back) | PASS | PASS | PASS | PASS |
 | T11 | T1–T3 with no display attached | PASS | PASS | PASS | PASS |
+| T12 | Disk fetches (each delayed 400 ms) do not stall the guest: longest gap between frames while the pointer moves | PASS · 4 fetches · 33 ms | PASS · 18 fetches · 37 ms | PASS · 28 fetches · 59 ms | PASS · 16 fetches · 36 ms |
 
 Snapshot of the settled desktop (container, gzip sections): 0.57 MB · 2.0 MB · 11.1 MB · 12.4 MB.
 
@@ -31,6 +33,11 @@ Snapshot of the settled desktop (container, gzip sections): 0.57 MB · 2.0 MB ·
 - **T7** compares only pixels that stay still over 1.5 s, so a blinking caret is ignored. Golden images are recorded
   with `--record`, checked by eye, and kept in `conformance/golden/` (not committed: they are screenshots of the
   guest systems).
+- **T12** restores the desktop snapshot into a worker whose disk cache is empty, with every chunk fetch delayed by
+  400 ms, moves the pointer in a circle at 60 Hz and runs the profile's `diskLoad` (Mac: launch four Apple-menu items;
+  Windows: open Notepad). The sweep pauses while the hook itself uses the pointer or waits for the screen, and only
+  frame gaps inside sweeping time count. It passes with at least 3 fetches and no gap of 200 ms or more. Before the
+  disk patches the three Mac cores failed it with gaps of 416–836 ms: the guest stood still for each fetch.
 - **T8** shuts the guest down first where the core supports guest power-off (Mini vMac, Basilisk II, v86). SheepShaver
   cannot (see below), so its test boots the overlay of a machine that was not shut down, and the hook presses Return
   to close Mac OS 9's "did not shut down properly" notice.

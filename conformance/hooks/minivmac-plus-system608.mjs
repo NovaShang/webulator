@@ -1,5 +1,5 @@
 // Macintosh Plus, System 6.0.8 on Mini vMac (512×342, 1-bit).
-import { shutdownVia, menubarReady, aliveViaCalculator, cmd } from "./mac-common.mjs";
+import { shutdownVia, menubarReady, aliveViaCalculator, cmd, launchFromAppleMenu } from "./mac-common.mjs";
 
 // TeachText, opened through the "Welcome!" document, emptied (Select All, Delete) for a blank white page.
 async function blankTeachText(m, h) {
@@ -18,6 +18,7 @@ export default {
   shutdown: shutdownVia([185, 8], [200, 123]),
   ready: menubarReady,
   alive: aliveViaCalculator(107),
+  diskLoad: launchFromAppleMenu(59, 75, 171, 187),      // Access Privileges, Alarm Clock, Key Caps, Scrapbook
   cursor: {
     // Over the text area the cursor is the I-beam; its diff box starts 3 px left of and 4 px above the hot spot.
     park: [505, 20], offset: [-3, -4],

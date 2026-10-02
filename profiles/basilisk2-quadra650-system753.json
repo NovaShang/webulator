@@ -4,7 +4,7 @@
   "core": {
     "adapter": "macemu",
     "module": "../assets/cores/basilisk2/basilisk2.mjs",
-    "buildId": "sha256:2d346e8d5a3cba783469a816bca75110109f4758eaf868368cc43c61fa7805bf"
+    "buildId": "sha256:1c2e59cfe1696fe6be657e58486200815abbd81d9abf91257e3d711e6805ef8f"
   },
   "machine": {
     "name": "Quadra 650",
