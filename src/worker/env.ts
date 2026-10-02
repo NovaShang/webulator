@@ -4,7 +4,7 @@ import { CTRL, FLAG, EV, peekEvent, consumeEvent } from "../control";
 import type { InitMsg, WorkerMsg, Overlay } from "../protocol";
 import type { Rect } from "../types";
 import { clock, realPerf } from "./clock";
-import type { BlockDevice } from "./disks";
+import { pumpFetches, type BlockDevice } from "./disks";
 
 // Minimum ms between frame posts. Below 16.7 on purpose: guests refresh at ~60 Hz with jitter, and a 16 ms floor
 // would push every slightly early frame to the next refresh (a dropped frame, felt as a stuttering cursor).
@@ -55,6 +55,7 @@ export class Env {
    */
   poll(canBlock: boolean, allowSnapshot = true): { snapshot: boolean } {
     this.flush(false);
+    pumpFetches();
     if (this.flag(FLAG.OVERLAYS)) {
       this.clearFlag(FLAG.OVERLAYS);
       const overlays = this.exportOverlays();

@@ -33,18 +33,20 @@ const state = await m.saveState();             // restore it later, in a fresh p
   as properties, not as missing features.
 - **Snapshots first.** Save a running machine and restore it into a new instance, first frame identical to the pixel.
 - **A virtual clock.** The guest never sees time pass while it is paused or stored.
+- **Disk fetches never stall the guest.** Disk images load lazily over the network; while a chunk is on its way the
+  guest keeps running and taking interrupts (its cursor keeps moving), as a real machine does while its disk is busy.
 - **Leave emulator source alone where possible.** Use build flags and a shared host runtime; when a patch is
   unavoidable, keep it small, pinned and upstreamable.
 
 ## What has been verified
 
-Headless Chromium 153 on an Apple M2, all eleven conformance tests per profile (details in `docs/conformance.md`):
+Headless Chromium 153 on an Apple M2, all twelve conformance tests per profile (details in `docs/conformance.md`):
 
 | Profile | Cold boot | Snapshot (gzip) | Restore → first frame | First frame vs saved | Emulator source changes |
 |---|---|---|---|---|---|
-| Mini vMac · System 6.0.8 | 2.7 s | 0.57 MB | 46–85 ms | identical | none |
-| Basilisk II · System 7.5.3 | 4.0 s | 2.0 MB | 77–140 ms | identical | none |
-| SheepShaver · Mac OS 9.0.4 | 27.9 s | 11.1 MB | 158–217 ms | identical | none |
+| Mini vMac · System 6.0.8 | 2.7 s | 0.57 MB | 46–85 ms | identical | disk driver: report "busy" instead of blocking (small patch) |
+| Basilisk II · System 7.5.3 | 4.0 s | 2.0 MB | 77–140 ms | identical | disk driver: report "busy" instead of blocking (small patch) |
+| SheepShaver · Mac OS 9.0.4 | 27.9 s | 11.1 MB | 158–217 ms | identical | disk driver: report "busy" instead of blocking (small patch) |
 | v86 · Windows 98 | 19.1 s | 12.4 MB | 137–170 ms | identical | none |
 
 ## Repository
@@ -53,7 +55,7 @@ Headless Chromium 153 on an Apple M2, all eleven conformance tests per profile (
 |---|---|
 | `src/` | The library: `Machine` API (main thread), worker runtime, core adapters (`macemu`, `v86`) |
 | `profiles/` | The four verified profiles |
-| `conformance/` | The conformance suite (T1–T11), per-profile hooks, Playwright runner |
+| `conformance/` | The conformance suite (T1–T12), per-profile hooks, Playwright runner |
 | `tools/` | Build, dev server, disk chunking, build ids, overlay merge |
 | `docs/spec.md` | The v1 API spec (currently in Chinese) |
 | `docs/conformance.md` | Results, test method, profile preparation, known issues |

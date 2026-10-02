@@ -1,5 +1,5 @@
 // Power Macintosh G3, Mac OS 9.0.4 on SheepShaver (640×480).
-import { shutdownVia, menuTextReady, aliveViaCalculator, cmd } from "./mac-common.mjs";
+import { shutdownVia, menuTextReady, aliveViaCalculator, cmd, launchFromAppleMenu } from "./mac-common.mjs";
 
 export default {
   bootTimeout: 120000,
@@ -19,6 +19,7 @@ export default {
   },
   ready: menuTextReady,
   alive: aliveViaCalculator(68),
+  diskLoad: launchFromAppleMenu(50, 140, 194, 212),     // Apple System Profiler, Key Caps, Scrapbook, Sherlock 2
   // The desktop is solid; the arrow's white outline starts one pixel up and left of the hot spot.
   cursor: { area: { x: 20, y: 40, width: 400, height: 240 }, park: [300, 8], offset: [-1, -1] },
   textEcho: {

@@ -1,0 +1,118 @@
+--- a/BasiliskII/src/Unix/disk_unix.h
++++ b/BasiliskII/src/Unix/disk_unix.h
+@@ -47,6 +47,12 @@
+ 		return true;
+ 	}
+ 	virtual void eject() { }
++
++	// Whether [offset, offset + length) can be read or written without waiting. A disk that fetches its data
++	// lazily returns false and starts the fetch; DiskPrime then reports "busy" and the guest retries.
++	virtual bool ready(loff_t offset, size_t length) {
++		return true;
++	}
+ };
+ 
+ typedef disk_generic::status (disk_factory)(const char *path, bool read_only,
+--- a/BasiliskII/src/Unix/JS/disk_js.cpp
++++ b/BasiliskII/src/Unix/JS/disk_js.cpp
+@@ -43,6 +43,11 @@
+     return size;
+   }
+ 
++  virtual bool ready(loff_t offset, size_t length) {
++    return EM_ASM_INT({ return workerApi.disks.ready ? workerApi.disks.ready($0, $1, $2) : 1; }, disk_id,
++                      int(offset), int(length)) > 0;
++  }
++
+   virtual size_t read(void* buf, loff_t offset, size_t length) {
+     D(bug("disk_js.read: disk_id=%d offset=%lld length=%zu\n", disk_id, offset, length));
+     int read_size = EM_ASM_INT({ return workerApi.disks.read($0, $1, $2, $3); }, disk_id, buf,
+--- a/BasiliskII/src/include/sys.h
++++ b/BasiliskII/src/include/sys.h
+@@ -54,6 +54,7 @@
+ extern void Sys_close(void *fh);
+ extern size_t Sys_read(void *fh, void *buffer, loff_t offset, size_t length);
+ extern size_t Sys_write(void *fh, void *buffer, loff_t offset, size_t length);
++extern bool Sys_ready(void *fh, loff_t offset, size_t length);
+ extern loff_t SysGetFileSize(void *fh);
+ extern void SysEject(void *fh);
+ extern bool SysFormat(void *fh);
+--- a/BasiliskII/src/Unix/sys_unix.cpp
++++ b/BasiliskII/src/Unix/sys_unix.cpp
+@@ -759,6 +759,14 @@
+  *  Read "length" bytes from file/device, starting at "offset", to "buffer",
+  *  returns number of bytes read (or 0)
+  */
++
++bool Sys_ready(void *arg, loff_t offset, size_t length)
++{
++	mac_file_handle *fh = (mac_file_handle *)arg;
++	if (fh && fh->generic_disk)
++		return fh->generic_disk->ready(offset, length);
++	return true;
++}
+ 
+ size_t Sys_read(void *arg, void *buffer, loff_t offset, size_t length)
+ {
+--- a/BasiliskII/src/disk.cpp
++++ b/BasiliskII/src/disk.cpp
+@@ -330,6 +330,11 @@
+ 	if ((length & 0x1ff) || (position & 0x1ff))
+ 		return paramErr;
+ 
++	// Data not available yet (a lazily fetched disk image): report busy without blocking. The driver's Prime()
++	// stub retries while d0 == 1, so the guest keeps running, and taking interrupts, until the data arrives.
++	if (!Sys_ready(info->fh, position + info->start_byte, length))
++		return 1;
++
+ 	size_t actual = 0;
+ 	if ((ReadMacInt16(pb + ioTrap) & 0xff) == aRdCmd) {
+ 
+--- a/BasiliskII/src/rom_patches.cpp
++++ b/BasiliskII/src/rom_patches.cpp
+@@ -367,9 +367,9 @@
+ 	DiskDriverFlags >> 8, DiskDriverFlags & 0xff, 0, 0, 0, 0, 0, 0,
+ 	0x00, 0x18,							// Open() offset
+ 	0x00, 0x1c,							// Prime() offset
+-	0x00, 0x20,							// Control() offset
+-	0x00, 0x2c,							// Status() offset
+-	0x00, 0x52,							// Close() offset
++	0x00, 0x26,							// Control() offset
++	0x00, 0x32,							// Status() offset
++	0x00, 0x58,							// Close() offset
+ 	0x05, 0x2e, 0x44, 0x69, 0x73, 0x6b,	// ".Disk"
+ 
+ 	// Open()
+@@ -378,6 +378,8 @@
+ 
+ 	// Prime()
+ 	M68K_EMUL_OP_DISK_PRIME >> 8, M68K_EMUL_OP_DISK_PRIME & 0xff,
++	0x0c, 0x40, 0x00, 0x01,				//  cmp.w	#1,d0		(1 = data not fetched yet)
++	0x67, 0xf8,							//  beq.s	Prime		(retry; interrupts are taken in between)
+ 	0x60, 0x0e,							//  bra		IOReturn
+ 
+ 	// Control()
+--- a/SheepShaver/src/rom_patches.cpp
++++ b/SheepShaver/src/rom_patches.cpp
+@@ -413,9 +413,9 @@
+ 	DiskDriverFlags >> 8, DiskDriverFlags & 0xff, 0, 0, 0, 0, 0, 0,
+ 	0x00, 0x1c,							// Open() offset
+ 	0x00, 0x20,							// Prime() offset
+-	0x00, 0x24,							// Control() offset
+-	0x00, 0x30,							// Status() offset
+-	0x00, 0x56,							// Close() offset
++	0x00, 0x2a,							// Control() offset
++	0x00, 0x36,							// Status() offset
++	0x00, 0x5c,							// Close() offset
+ 	0x08, 0x2e, 0x41, 0x54, 0x41, 0x44, 0x69, 0x73, 0x6b, 0x00,	// ".ATADisk"
+ 
+ 	// Open()
+@@ -424,6 +424,8 @@
+ 
+ 	// Prime()
+ 	M68K_EMUL_OP_DISK_PRIME >> 8, M68K_EMUL_OP_DISK_PRIME & 0xff,
++	0x0c, 0x40, 0x00, 0x01,				//  cmp.w	#1,d0		(1 = data not fetched yet)
++	0x67, 0xf8,							//  beq.s	Prime		(retry; interrupts are taken in between)
+ 	0x60, 0x0e,							//  bra		IOReturn
+ 
+ 	// Control()

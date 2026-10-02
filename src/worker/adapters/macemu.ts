@@ -126,6 +126,8 @@ export async function runMacemu(env: Env): Promise<void> {
       close() {},
       size: (i: number) => [...env.disks.values()][i].size,
       read(i: number, ptr: number, off: number, len: number) { [...env.disks.values()][i].read(off, len, M.HEAPU8, ptr); return len; },
+      // Basilisk II / SheepShaver (patched disk driver): 0 = not fetched yet, the guest retries the request.
+      ready: (i: number, off: number, len: number) => ([...env.disks.values()][i].ready(off, len) ? 1 : 0),
       write(i: number, ptr: number, off: number, len: number) { [...env.disks.values()][i].write(off, M.HEAPU8.subarray(ptr, ptr + len)); return len; },
       consumeDiskName: () => null,
       isMediaPresent: () => 1, isFixedDisk: () => 1, eject() {},

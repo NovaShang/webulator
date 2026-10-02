@@ -2,7 +2,7 @@
 // adapter polls the control block on a timer instead of from inside a blocking core loop.
 import type { Env, Discrete } from "../env";
 import { FLAG } from "../../control";
-import type { BlockDevice } from "../disks";
+import { pumpFetches, type BlockDevice } from "../disks";
 import { KEY_CODES, PS2_SET1 } from "../../keyboard";
 import { HeadlessScreen } from "./v86screen";
 
@@ -17,15 +17,32 @@ type Config = {
   eventIntervalMs?: number;           // minimum guest time between key/button events (default 8)
 };
 
+// Disk requests whose data is still being fetched, oldest first. v86's IDE controller is asynchronous: it raises
+// the completion interrupt from the callback, and the CPU keeps running meanwhile, so the guest (and its mouse
+// pointer) is not held up by the network. Requests complete in order.
+type DiskOp = { dev: BlockDevice; start: number; len: number; run: () => void };
+const waiting: DiskOp[] = [];
+function completeReady() {
+  while (waiting.length && waiting[0].dev.ready(waiting[0].start, waiting[0].len)) waiting.shift()!.run();
+}
+
 function diskObject(dev: BlockDevice) {
   const read = (start: number, len: number) => { const d = new Uint8Array(len); dev.read(start, len, d); return d; };
+  const op = (start: number, len: number, run: () => void) => {
+    if (!waiting.length && dev.ready(start, len)) run();
+    else waiting.push({ dev, start, len, run });
+  };
   return {
     byteLength: dev.size,
     onload: null as null | ((e: unknown) => void), onprogress: null,
     load() { this.onload?.({}); },
-    get(start: number, len: number, cb: (d: Uint8Array) => void) { cb(read(start, len)); },
-    set(start: number, data: Uint8Array, cb?: () => void) { dev.write(start, data); cb?.(); },
-    get_and_cache(start: number, len: number, cb: (d: Uint8Array) => void) { cb(read(start, len)); },
+    get(start: number, len: number, cb: (d: Uint8Array) => void) { op(start, len, () => cb(read(start, len))); },
+    set(start: number, data: Uint8Array, cb?: () => void) {
+      // v86 may reuse `data` once set() returns, so a write that has to wait keeps its own copy.
+      const own = waiting.length || !dev.ready(start, data.length) ? data.slice() : data;
+      op(start, own.length, () => { dev.write(start, own); cb?.(); });
+    },
+    get_and_cache(start: number, len: number, cb: (d: Uint8Array) => void) { op(start, len, () => cb(read(start, len))); },
     get_from_cache(start: number, len: number) { return read(start, len); },
     get_buffer(cb: (b?: ArrayBuffer) => void) { cb(); },
     // Disk contents are saved by the runtime (overlays), not inside v86's own state.
@@ -64,6 +81,8 @@ export async function runV86(env: Env): Promise<void> {
   }
   if (restore) opts.initial_state = { buffer: restore.core };
 
+  // v86 reads the disk during its own startup too, before the tick below exists.
+  setInterval(() => { pumpFetches(); completeReady(); }, 4);
   const emu = new V86(opts);
   // v86 creates its (dummy) screen adapter later, during async init; swap our methods in as it is assigned.
   let adapter: unknown;
@@ -119,6 +138,7 @@ export async function runV86(env: Env): Promise<void> {
       }));
     }
     const { snapshot } = env.poll(false);
+    completeReady();
     if (env.paused && running) { emu.stop(); running = false; }
     if (!env.paused && !running) { emu.run(); running = true; }
 
@@ -140,7 +160,9 @@ export async function runV86(env: Env): Promise<void> {
     // cold boots with a 14 ms threshold (0 of 8 at 16 ms). The cost is an occasional repeated frame.
     if (now - lastRender >= 16) { lastRender = now; render(); env.flush(false); }
 
-    if (snapshot && !snapshotting) {
+    // A disk request in flight lives only in v86's IDE state and our queue, and a snapshot cannot carry the
+    // callback: wait for the queue to drain (the guest keeps running meanwhile).
+    if (snapshot && !snapshotting && !waiting.length) {
       // Render and save in the same task, so the saved frame matches the saved state exactly.
       snapshotting = true;
       render(); env.damage();

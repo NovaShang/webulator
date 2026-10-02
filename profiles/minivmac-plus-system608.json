@@ -4,7 +4,7 @@
   "core": {
     "adapter": "macemu",
     "module": "../assets/cores/minivmac/minivmac-plus.mjs",
-    "buildId": "sha256:c776cce4a42436febeb22dadcdd8e21a6c699f94b304a3f6b68b812a93838cc8"
+    "buildId": "sha256:4b1ee93f57cf0d35fe813953a0edda59444018f80929b5fbb524ca4970821dfe"
   },
   "machine": {
     "name": "Macintosh Plus",

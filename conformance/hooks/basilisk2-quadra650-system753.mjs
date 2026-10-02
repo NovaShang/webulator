@@ -1,5 +1,5 @@
 // Quadra 650, System 7.5.3 on Basilisk II (640×480).
-import { shutdownVia, menubarReady, aliveViaCalculator, cmd } from "./mac-common.mjs";
+import { shutdownVia, menubarReady, aliveViaCalculator, cmd, launchFromAppleMenu } from "./mac-common.mjs";
 
 // Bring Stickies to the front by clicking the note on the desktop, File > New Note, then drag its grow box
 // so the note covers a large solid area.
@@ -19,6 +19,7 @@ export default {
   shutdown: shutdownVia([232, 8], [250, 139]),
   ready: menubarReady,
   alive: aliveViaCalculator(107),
+  diskLoad: launchFromAppleMenu(186, 204, 222, 276),   // Jigsaw Puzzle, Key Caps, Note Pad, Scrapbook
   cursor: {
     // Over the note's text the cursor is the I-beam (diff box 3 px left of and 4 px above the hot spot).
     park: [630, 470], offset: [-3, -4],

@@ -87,6 +87,7 @@ export class Machine {
     const init: InitMsg = {
       type: "init", ctrl: buf, profile: this.config.profile, memory: this.info.memory,
       disks: await this.diskList(overlays), clockStart: this.config.clock?.start, restore,
+      diskLatencyMs: this.config.debug?.diskLatencyMs,
     };
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new CoreCrashedError("core did not start in time")), STARTUP_TIMEOUT);

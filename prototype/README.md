@@ -23,6 +23,19 @@ the spec's input ring buffer, block-device laziness and v86 support are not here
 
 The build scripts expect a copy of the emulator source mounted at `/src/macemu` or `/src/minivmac` inside the container.
 
+## Patches
+
+The cores in use carry one patch each, applied to the commits above with `patch -p1`:
+
+| Patch | What |
+|---|---|
+| `build/macemu/patches/async-disk.patch` | Basilisk II and SheepShaver: the disk driver's Prime reports "busy" while the runtime is still fetching the data (`workerApi.disks.ready`), and the driver stub in ROM retries, so the guest keeps running (and drawing its cursor) during the fetch |
+| `build/minivmac/patches/async-disk.patch` | Mini vMac: the same, with the retry loop appended after the replacement `.Sony` driver |
+
+Production links: Basilisk II with `relink.sh` and `-sASYNCIFY_ONLY=@/src/only.json -sINITIAL_MEMORY=83886080`;
+SheepShaver with `build-sheep.sh` (`RELINK_FLAGS` with `only-sheep.json`, `-sINITIAL_MEMORY=134217728`); Mini vMac
+with `build.sh` (the `async` output, `-O0`).
+
 ## Assets you supply
 
 ROMs (Mac Plus, Quadra 650, Power Macintosh 9500, New World) and system disk images are not in this repository. The

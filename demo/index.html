@@ -169,13 +169,13 @@
     <div>
       <h1>One browser API for emulated computers</h1>
       <p>Webulator runs WebAssembly emulators in a worker and puts them behind one contract: snapshots, exact pointer
-        input, a virtual clock and copy-on-write disks. A core counts as supported only when it passes the same eleven
+        input, a virtual clock and copy-on-write disks. A core counts as supported only when it passes the same twelve
         conformance tests as every other core.</p>
     </div>
     <dl class="facts">
       <div><dt>cores</dt><dd>4</dd></div>
       <div><dt>CPU families</dt><dd>3</dd></div>
-      <div><dt>tests passed</dt><dd>44/44</dd></div>
+      <div><dt>tests passed</dt><dd>48/48</dd></div>
     </dl>
   </div>
 
@@ -232,8 +232,9 @@ m.input.pointer.button(<span class="s">0</span>, <span class="k">true</span>);
         <div><dt>A virtual clock</dt>
           <dd>The guest sees no time pass while it is paused or stored, so a restored machine behaves like one that
             never stopped.</dd></div>
-        <div><dt>Emulator source left alone</dt>
-          <dd>All four cores run unmodified. Snapshots come from build flags (Emscripten Asyncify) and a shared runtime.</dd></div>
+        <div><dt>Disk fetches never stall the guest</dt>
+          <dd>Disk images load lazily over the network. While a chunk is on its way the guest keeps running, so the
+            cursor keeps moving, as on a real machine with a busy disk.</dd></div>
       </dl>
     </div>
   </section>
@@ -260,6 +261,7 @@ m.input.pointer.button(<span class="s">0</span>, <span class="k">true</span>);
           <tr><td class="id">T9</td><td class="t">Snapshot taken while the guest is busy booting, then restored</td><td><span class="pass">164 ms</span></td><td><span class="pass">269 ms</span></td><td><span class="pass">497 ms</span></td><td><span class="pass">270 ms</span></td></tr>
           <tr><td class="id">T10</td><td class="t">No input lost: about 380 key events sent back to back</td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td></tr>
           <tr><td class="id">T11</td><td class="t">T1 to T3 with no display attached</td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td><td><span class="pass"></span></td></tr>
+          <tr><td class="id">T12</td><td class="t">Disk fetches delayed 400 ms each: longest pause in the moving cursor</td><td><span class="pass">33 ms</span></td><td><span class="pass">37 ms</span></td><td><span class="pass">59 ms</span></td><td><span class="pass">36 ms</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -274,13 +276,14 @@ m.input.pointer.button(<span class="s">0</span>, <span class="k">true</span>);
         <thead><tr><th>Core</th><th>CPU</th><th>Machine in the demo</th><th>Snapshot</th><th>License</th><th>Source changes</th></tr></thead>
         <tbody>
           <tr><td><a href="https://github.com/copy/v86">v86</a></td><td>x86</td><td>PC · Windows 98</td><td class="num">12.4 MB</td><td>BSD-2-Clause</td><td class="muted">none</td></tr>
-          <tr><td><a href="https://github.com/mihaip/minivmac">Mini vMac</a></td><td>68000</td><td>Macintosh Plus · System 6.0.8</td><td class="num">0.6 MB</td><td>GPL-2.0</td><td class="muted">none</td></tr>
-          <tr><td><a href="https://github.com/mihaip/macemu">Basilisk II</a></td><td>68040</td><td>Quadra 650 · System 7.5.3</td><td class="num">2.0 MB</td><td>GPL-2.0</td><td class="muted">none</td></tr>
-          <tr><td><a href="https://github.com/mihaip/macemu">SheepShaver</a></td><td>PowerPC</td><td>Power Macintosh G3 · Mac OS 9.0.4</td><td class="num">11.1 MB</td><td>GPL-2.0</td><td class="muted">none</td></tr>
+          <tr><td><a href="https://github.com/mihaip/minivmac">Mini vMac</a></td><td>68000</td><td>Macintosh Plus · System 6.0.8</td><td class="num">0.6 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
+          <tr><td><a href="https://github.com/mihaip/macemu">Basilisk II</a></td><td>68040</td><td>Quadra 650 · System 7.5.3</td><td class="num">2.0 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
+          <tr><td><a href="https://github.com/mihaip/macemu">SheepShaver</a></td><td>PowerPC</td><td>Power Macintosh G3 · Mac OS 9.0.4</td><td class="num">11.1 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="table-note">Snapshot sizes are gzip-compressed. The Mac cores are Infinite Mac's builds, rebuilt with Asyncify enabled.</p>
+    <p class="table-note">Snapshot sizes are gzip-compressed. The Mac cores are Infinite Mac's builds, rebuilt with Asyncify
+      enabled and one small patch: the disk driver reports "busy" instead of blocking while data is fetched.</p>
   </section>
 
   <footer>

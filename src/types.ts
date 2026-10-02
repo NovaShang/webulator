@@ -49,6 +49,8 @@ export type MachineConfig = {
   snapshot?: { url: string } | Blob | ArrayBuffer;
   clock?: { start?: number };             // epoch ms
   display?: HTMLCanvasElement;
+  /** Test hooks; not part of the contract. diskLatencyMs delays every background disk fetch. */
+  debug?: { diskLatencyMs?: number };
 };
 
 export type MachineState = "running" | "paused" | "destroyed" | "crashed";
