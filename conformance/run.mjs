@@ -3,6 +3,7 @@
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { startWorkerProfiles, summarize } from "./cdp-prof.mjs";
 
 const args = process.argv.slice(2);
 const opt = k => (args.find(a => a.startsWith(`--${k}=`)) ?? "").split("=")[1];
@@ -14,12 +15,24 @@ await new Promise(r => setTimeout(r, 500));
 fs.mkdirSync("conformance/results", { recursive: true });
 
 const browser = await chromium.launch({ headless: !args.includes("--headed"),
-  args: ["--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"] });
+  args: ["--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+    ...(args.includes("--cpuprofile") ? ["--remote-debugging-port=9333"] : [])] });
 const summary = {};
 for (const id of profiles.length ? profiles : all) {
   const t0 = Date.now();
   const page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
-  page.on("console", m => console.log(`[${id} +${((Date.now() - t0) / 1000).toFixed(0)}s]`, m.text()));
+  let stopProf = null;
+  page.on("console", async m => {
+    console.log(`[${id} +${((Date.now() - t0) / 1000).toFixed(0)}s]`, m.text());
+    if (m.text() === "PROF start" && args.includes("--cpuprofile")) stopProf = await startWorkerProfiles(9333);
+    if (m.text() === "PROF stop" && stopProf) {
+      for (const [i, w] of (await stopProf()).entries()) {
+        fs.writeFileSync(`conformance/results/${id}-worker${i}.cpuprofile`, JSON.stringify(w.profile));
+        const s = summarize(w.profile);
+        console.log(`\n=== worker ${i} ${w.url.split("/").pop()} sampled ${s.total_ms.toFixed(0)}ms ===\n` + s.rows.join("\n"));
+      }
+    }
+  });
   page.on("worker", w => w.on("console", m => console.log(`[${id} worker]`, m.text())));
   page.on("pageerror", e => console.log(`[${id}] pageerror`, e.stack || e.message));
   const q = new URLSearchParams({ profile: id, suite: opt("suite") ?? "conformance", tests: opt("tests") ?? "all", record: args.includes("--record") ? "1" : "", realclock: args.includes("--realclock") ? "1" : "", steps: opt("steps") ?? "", nopoll: opt("nopoll") ?? "", secs: opt("secs") ?? "", debug: opt("debug") ?? "", bakewait: opt("bakewait") ?? "", overlay: opt("overlay") ?? "", noready: opt("noready") ?? "", prepare: opt("prepare") ?? "" });

@@ -119,7 +119,8 @@ async function explore() {
     await settle(m, hooks.settle ?? 2000, 60000);
   }
   for (const step of (Q.get("steps") || "").split(";").filter(Boolean)) {
-    const [op, arg = ""] = step.split(":"); const [a, b] = arg.split(",").map(Number);
+    const at = step.indexOf(":"), op = at < 0 ? step : step.slice(0, at), arg = at < 0 ? "" : step.slice(at + 1);
+    const [a, b] = arg.split(",").map(Number);
     if (op === "move") m.input.pointer.moveTo(a, b);
     if (op === "down") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(0, true); }
     if (op === "up") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(0, false); }
@@ -129,6 +130,7 @@ async function explore() {
     if (op === "type") await m.input.type(decodeURIComponent(arg));
     if (op === "shot") await shot(m, "explore-" + arg);
     if (op === "debug") m._debug();
+    if (op === "prof") console.log("PROF " + arg);
     if (op === "wait") await sleep(a);
     await sleep(400);
   }
