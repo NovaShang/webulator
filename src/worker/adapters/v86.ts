@@ -149,7 +149,7 @@ export async function runV86(env: Env): Promise<void> {
         backdoor: cpu.devices.vmware && { seen: cpu.devices.vmware.seen, rpc: cpu.devices.vmware["rpc_log"],  en: cpu.devices.vmware.enabled, abs: cpu.devices.vmware.absolute },
         vga: (() => { const v = cpu.devices.vga, s = v.vmsvga; return { gfx: v.graphical_mode, svga: v.svga_enabled,
           size: [v.svga_width, v.svga_height, v.svga_bpp], vm: s && { id: s.id.toString(16), en: s.enable, cfg: s.config_done,
-          w: s.width, h: s.height, bpp: s.bpp, stats: s.stats, stats3d: s.stats3d, gpu: s.gpu && { errors: s.gpu["shader_errors"], draws: s.gpu.stats.draws, presents: s.gpu.stats.presents, gl: !!s.gpu.gl, failed: s.gpu.failed, unsupported: s.gpu.stats.unsupported }, g3d: s.fifo()[288], regs: s.reg_log.filter(x => /^w(1|2|3|7)=/.test(x)).slice(-30).join(" "), trace3d: s.trace3d.length,
+          w: s.width, h: s.height, bpp: s.bpp, stats: s.stats, stats3d: s.stats3d, hc: s["hc_debug"]?.(), gpu: s.gpu && { errors: s.gpu["shader_errors"], draws: s.gpu.stats.draws, presents: s.gpu.stats.presents, gl: !!s.gpu.gl, failed: s.gpu.failed, unsupported: s.gpu.stats.unsupported }, g3d: s.fifo()[288], regs: s.reg_log.filter(x => /^w(1|2|3|7)=/.test(x)).slice(-30).join(" "), trace3d: s.trace3d.length,
           taskbar: (() => { const m = v.svga_memory, out = []; for (let o = 0; o < 4e6 && out.length < 6; o += 4) {
               let run = 0; while (run < 64 && m[o + run * 4] > 180 && m[o + run * 4 + 2] < 70 && m[o + run * 4 + 1] < 130) run++;
               if (run === 64) { out.push(o); o += 2560 * 4; } } return out.join(","); })(),
