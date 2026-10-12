@@ -84,7 +84,7 @@ async function smoke() {
   m.on("resize", r => log("  resize", r.width, r.height));
   let frames = 0; m.on("frame", () => frames++);
   log(`started in ${(performance.now() - t0).toFixed(0)} ms`);
-  for (let i = 1; i <= 12; i++) { await sleep(5000); log(`t=${i * 5}s frames=${frames} screen=${m.screen.width}x${m.screen.height}`); await shot(m, `smoke-${String(i * 5).padStart(2, "0")}s`); }
+  for (let i = 1; i <= (+Q.get("secs") || 60) / 5; i++) { await sleep(5000); log(`t=${i * 5}s frames=${frames} screen=${m.screen.width}x${m.screen.height}`); await shot(m, `smoke-${String(i * 5).padStart(3, "0")}s`); if (Q.get("debug")) m._debug(); }
   const acc = await m.disks.get(profile.disks[0].id).access();
   log(`disk: ${acc.chunkFetches} chunks, ${(acc.bytesFetched / 1048576).toFixed(1)} MB, ${acc.fetchMs.toFixed(0)} ms in sync fetches`);
   await fetch(`/uploads/${ID}/touched.json`, { method: "PUT", body: JSON.stringify(acc.touched) });
@@ -98,6 +98,7 @@ async function bake() {
   const m = await Machine.create({ profile, clock: { start: FIXED_CLOCK } });
   m.on("log", t => log("  core:", t));
   await sleep(+(Q.get("bakewait") || 60000));
+  if (hooks.bakePrepare) await hooks.bakePrepare(m, { sleep, settle, click, shot: n => shot(m, n) });
   await shot(m, "bake-before-shutdown");
   await hooks.shutdown(m, { sleep, settle, click });
   await sleep(20000);
@@ -118,6 +119,8 @@ async function explore() {
     if (op === "move") m.input.pointer.moveTo(a, b);
     if (op === "down") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(0, true); }
     if (op === "up") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(0, false); }
+    if (op === "key") { for (const k of arg.split("+")) m.input.key(k, true); for (const k of arg.split("+").reverse()) m.input.key(k, false); }
+    if (op === "type") await m.input.type(decodeURIComponent(arg));
     if (op === "shot") await shot(m, "explore-" + arg);
     if (op === "wait") await sleep(a);
     await sleep(400);

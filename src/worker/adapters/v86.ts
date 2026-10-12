@@ -133,6 +133,7 @@ export async function runV86(env: Env): Promise<void> {
       const cpu = emu.v86.cpu, ide = cpu.devices.ide?.primary?.master;
       env.log("debug " + JSON.stringify({
         eip: (cpu.instruction_pointer[0] >>> 0).toString(16), hlt: cpu.in_hlt[0], if: !!(cpu.get_eflags?.() & 0x200),
+        ic: emu.get_instruction_counter(), t: Math.round(performance.now()),
         running, ide: ide && { status: ide.status_reg.toString(16), error: ide.error_reg, cmd: ide.current_command?.toString(16),
           dma: ide.channel?.dma_status, lba: [ide.lba_high_reg, ide.lba_mid_reg, ide.lba_low_reg] },
       }));

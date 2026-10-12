@@ -6,17 +6,18 @@ import crypto from "node:crypto";
 
 const [img, out, name] = process.argv.slice(2);
 const CS = 256 * 1024;
-const buf = fs.readFileSync(img);
+// Read chunk by chunk: images can be larger than Node's 2 GB readFileSync limit.
+const size = fs.statSync(img).size, fd = fs.openSync(img, "r"), cbuf = Buffer.alloc(CS);
 fs.mkdirSync(path.join(out, "chunks"), { recursive: true });
 const chunks = [];
-for (let off = 0; off < buf.length; off += CS) {
-  const c = buf.subarray(off, Math.min(off + CS, buf.length));
+for (let off = 0; off < size; off += CS) {
+  const c = cbuf.subarray(0, fs.readSync(fd, cbuf, 0, Math.min(CS, size - off), off));
   if (c.every(b => b === 0)) { chunks.push(""); continue; }
   const h = crypto.createHash("sha256").update(c).digest("hex");
   const f = path.join(out, "chunks", h);
   if (!fs.existsSync(f)) fs.writeFileSync(f, c);
   chunks.push(h);
 }
-const manifest = { format: "webulator-disk/1", name: name ?? path.basename(img), size: buf.length, chunkSize: CS, chunks, baseUrl: "chunks/" };
+const manifest = { format: "webulator-disk/1", name: name ?? path.basename(img), size, chunkSize: CS, chunks, baseUrl: "chunks/" };
 fs.writeFileSync(path.join(out, "manifest.json"), JSON.stringify(manifest));
 console.log(`${img}: ${chunks.length} chunks, ${chunks.filter(Boolean).length} stored`);
