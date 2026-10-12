@@ -127,17 +127,29 @@ export async function runV86(env: Env): Promise<void> {
     }
   };
 
+  // Guest EIP histogram by 4 KB page, sampled every tick and reported (then reset) by the debug dump.
+  const eipPages = new Map<number, number>(), eipExact = new Map<number, number>();
   const tick = () => {
+    { const ip = emu.v86.cpu.instruction_pointer[0] >>> 0, p = ip >>> 12; eipPages.set(p, (eipPages.get(p) ?? 0) + 1);
+      if (ip >= 0x80000000) eipExact.set(ip, (eipExact.get(ip) ?? 0) + 1); }
     if (env.flag(FLAG.DEBUG)) {
       env.clearFlag(FLAG.DEBUG);
       const cpu = emu.v86.cpu, ide = cpu.devices.ide?.primary?.master;
       env.log("debug " + JSON.stringify({
         eip: (cpu.instruction_pointer[0] >>> 0).toString(16), hlt: cpu.in_hlt[0], if: !!(cpu.get_eflags?.() & 0x200),
         ic: emu.get_instruction_counter(), t: Math.round(performance.now()),
-        backdoor: cpu.devices.vmware && { seen: cpu.devices.vmware.seen, trace: cpu.devices.vmware.trace.join(" "), en: cpu.devices.vmware.enabled, abs: cpu.devices.vmware.absolute },
+        tick_stats: (() => { const st = emu.v86["tick_stats"]; const r = st && { ...st }; if (st) { st["busy_ms"] = 0; st["ticks"] = 0; st["halted_ticks"] = 0; } return r; })(),
+        eip_pages: (() => { const all = [...eipPages].sort((a, b) => b[1] - a[1]); eipPages.clear();
+          return all.map(([p, n]) => (p << 12 >>> 0).toString(16) + ":" + n).join(" "); })(),
+        kernel_eips: (() => { const all = [...eipExact].sort((a, b) => b[1] - a[1]).slice(0, 12); eipExact.clear();
+          const mem = emu.v86.cpu.mem8;
+          return all.map(([ip, n]) => { const ph = ip & 0x1fffffff, bytes = [];
+            for (let i = -48; i < 32; i++) bytes.push(mem[ph + i].toString(16).padStart(2, "0"));
+            return ip.toString(16) + ":" + n + ":" + bytes.join(""); }); })(),
+        backdoor: cpu.devices.vmware && { seen: cpu.devices.vmware.seen, rpc: cpu.devices.vmware["rpc_log"],  en: cpu.devices.vmware.enabled, abs: cpu.devices.vmware.absolute },
         vga: (() => { const v = cpu.devices.vga, s = v.vmsvga; return { gfx: v.graphical_mode, svga: v.svga_enabled,
           size: [v.svga_width, v.svga_height, v.svga_bpp], vm: s && { id: s.id.toString(16), en: s.enable, cfg: s.config_done,
-          w: s.width, h: s.height, bpp: s.bpp, stats: s.stats, stats3d: s.stats3d, g3d: s.fifo()[288], regs: s.reg_log.filter(x => /^w(1|2|3|7)=/.test(x)).slice(-30).join(" "), trace3d: s.trace3d.length,
+          w: s.width, h: s.height, bpp: s.bpp, stats: s.stats, stats3d: s.stats3d, gpu: s.gpu && { errors: s.gpu["shader_errors"], draws: s.gpu.stats.draws, presents: s.gpu.stats.presents, gl: !!s.gpu.gl, failed: s.gpu.failed, unsupported: s.gpu.stats.unsupported }, g3d: s.fifo()[288], regs: s.reg_log.filter(x => /^w(1|2|3|7)=/.test(x)).slice(-30).join(" "), trace3d: s.trace3d.length,
           taskbar: (() => { const m = v.svga_memory, out = []; for (let o = 0; o < 4e6 && out.length < 6; o += 4) {
               let run = 0; while (run < 64 && m[o + run * 4] > 180 && m[o + run * 4 + 2] < 70 && m[o + run * 4 + 1] < 130) run++;
               if (run === 64) { out.push(o); o += 2560 * 4; } } return out.join(","); })(),
