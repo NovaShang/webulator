@@ -134,12 +134,24 @@ export async function runV86(env: Env): Promise<void> {
       env.log("debug " + JSON.stringify({
         eip: (cpu.instruction_pointer[0] >>> 0).toString(16), hlt: cpu.in_hlt[0], if: !!(cpu.get_eflags?.() & 0x200),
         ic: emu.get_instruction_counter(), t: Math.round(performance.now()),
+        backdoor: cpu.devices.vmware && { seen: cpu.devices.vmware.seen, trace: cpu.devices.vmware.trace.join(" "), en: cpu.devices.vmware.enabled, abs: cpu.devices.vmware.absolute },
+        vga: (() => { const v = cpu.devices.vga, s = v.vmsvga; return { gfx: v.graphical_mode, svga: v.svga_enabled,
+          size: [v.svga_width, v.svga_height, v.svga_bpp], vm: s && { id: s.id.toString(16), en: s.enable, cfg: s.config_done,
+          w: s.width, h: s.height, bpp: s.bpp, stats: s.stats, stats3d: s.stats3d, g3d: s.fifo()[288], regs: s.reg_log.filter(x => /^w(1|2|3|7)=/.test(x)).slice(-30).join(" "), trace3d: s.trace3d.length,
+          taskbar: (() => { const m = v.svga_memory, out = []; for (let o = 0; o < 4e6 && out.length < 6; o += 4) {
+              let run = 0; while (run < 64 && m[o + run * 4] > 180 && m[o + run * 4 + 2] < 70 && m[o + run * 4 + 1] < 130) run++;
+              if (run === 64) { out.push(o); o += 2560 * 4; } } return out.join(","); })(),
+          col: Array.from({ length: 12 }, (_, y) => { const m = v.svga_memory, o = 100 * 2560 + y * 1280 + 400; return [m[o], m[o + 1], m[o + 2], m[o + 3]].map(x => x.toString(16).padStart(2, "0")).join(""); }).join(" "),
+          stride: [640, 1280, 1920, 2560, 3200, 4096, 5120].map(st => { const m = v.svga_memory; let d = 0;
+            for (let o = 0; o < 600000; o += 97) d += Math.abs(m[o] - m[o + st]); return st + ":" + d; }).join(" ") } }; })(),
         running, ide: ide && { status: ide.status_reg.toString(16), error: ide.error_reg, cmd: ide.current_command?.toString(16),
           dma: ide.channel?.dma_status, lba: [ide.lba_high_reg, ide.lba_mid_reg, ide.lba_low_reg] },
       }));
     }
     const { snapshot } = env.poll(false);
     completeReady();
+    const vm = emu.v86?.cpu?.devices?.vga?.vmsvga;
+    if (vm && vm.trace3d.length >= 3000 && !vm.trace_sent) { vm.trace_sent = true; env.log("trace3d " + vm.trace3d.join("\n")); }
     if (env.paused && running) { emu.stop(); running = false; }
     if (!env.paused && !running) { emu.run(); running = true; }
 

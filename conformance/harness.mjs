@@ -88,6 +88,7 @@ async function smoke() {
   const acc = await m.disks.get(profile.disks[0].id).access();
   log(`disk: ${acc.chunkFetches} chunks, ${(acc.bytesFetched / 1048576).toFixed(1)} MB, ${acc.fetchMs.toFixed(0)} ms in sync fetches`);
   await fetch(`/uploads/${ID}/touched.json`, { method: "PUT", body: JSON.stringify(acc.touched) });
+  if (Q.get("overlay")) await fetch(`/uploads/${ID}/smoke-overlay.bin`, { method: "PUT", body: await m.disks.get(profile.disks[0].id).exportOverlay() });
   result("smoke", true, { frames, disk: { chunks: acc.chunkFetches, fetch_ms: Math.round(acc.fetchMs) } });
   await m.destroy();
 }
@@ -98,7 +99,7 @@ async function bake() {
   const m = await Machine.create({ profile, clock: { start: FIXED_CLOCK } });
   m.on("log", t => log("  core:", t));
   await sleep(+(Q.get("bakewait") || 60000));
-  if (hooks.bakePrepare) await hooks.bakePrepare(m, { sleep, settle, click, shot: n => shot(m, n) });
+  if (hooks.bakePrepare && Q.get("prepare")) await hooks.bakePrepare(m, { sleep, settle, click, shot: n => shot(m, n) });
   await shot(m, "bake-before-shutdown");
   await hooks.shutdown(m, { sleep, settle, click });
   await sleep(20000);
@@ -112,16 +113,22 @@ async function bake() {
 // Explore: boot, then run "steps" from the URL, e.g. steps=down:185,8;shot:special;up:185,8
 async function explore() {
   const m = await Machine.create({ profile, clock: { start: FIXED_CLOCK } });
-  await waitFor(async () => hooks.ready(await m.screen.read()), hooks.bootTimeout ?? 120000, 100);
-  await settle(m, hooks.settle ?? 2000, 60000);
+  m.on("log", t => log("  core:", t));
+  if (!Q.get("noready")) {
+    await waitFor(async () => hooks.ready(await m.screen.read()), hooks.bootTimeout ?? 120000, 100);
+    await settle(m, hooks.settle ?? 2000, 60000);
+  }
   for (const step of (Q.get("steps") || "").split(";").filter(Boolean)) {
     const [op, arg = ""] = step.split(":"); const [a, b] = arg.split(",").map(Number);
     if (op === "move") m.input.pointer.moveTo(a, b);
     if (op === "down") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(0, true); }
     if (op === "up") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(0, false); }
+    if (op === "rdown") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(1, true); }
+    if (op === "rup") { m.input.pointer.moveTo(a, b); await sleep(60); m.input.pointer.button(1, false); }
     if (op === "key") { for (const k of arg.split("+")) m.input.key(k, true); for (const k of arg.split("+").reverse()) m.input.key(k, false); }
     if (op === "type") await m.input.type(decodeURIComponent(arg));
     if (op === "shot") await shot(m, "explore-" + arg);
+    if (op === "debug") m._debug();
     if (op === "wait") await sleep(a);
     await sleep(400);
   }
@@ -187,6 +194,7 @@ async function conformance() {
     await shot(m, "T1-fail"); await m.destroy(); return;
   }
   await shot(m, "T1-ready");
+  if (H.afterReady) { await H.afterReady(m, { sleep, settle }); await settle(m, 800, 20000); }
 
   // Snapshot of the settled desktop, used by T2–T4, T7.
   t = performance.now();
@@ -268,6 +276,11 @@ async function conformance() {
         await waitFor(() => r.screen.seq > 0, 5000, 5);
         restoreMs.push(+(performance.now() - t).toFixed(1));
         diffs.push(diffCount(await r.screen.read(), s0frame));
+        if (i === 0 && diffs[0] > 0) {
+          await shot(r, "T2-restored");
+          const c = new OffscreenCanvas(s0frame.width, s0frame.height); c.getContext("2d").putImageData(s0frame, 0, 0);
+          await putFile("T2-saved.png", await c.convertToBlob());
+        }
         if (i === 4) {
           try { baseline = await H.alive(r, { waitChange, click, sleep, settle, shot: n => shot(r, n) }); result("T3", true, baseline); }
           catch (e) { result("T3", false, { error: e.message }); await shot(r, "T3-fail"); }

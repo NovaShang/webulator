@@ -3,6 +3,7 @@ const at = (img, x, y) => { const i = (y * img.width + x) * 4; return [img.data[
 export default {
   bootTimeout: 600000,
   settle: 5000,
+  busyAt: 8000,
   // The Luna taskbar along the bottom edge with the green Start button at its left end (the logon screen has a
   // similar blue strip, but no Start button).
   ready: img => {
@@ -13,11 +14,10 @@ export default {
   // Start menu opens (click), closes with Escape; Run dialog opens Notepad.
   async alive(m, h) {
     const t = {};
-    const menu = { x: 0, y: 150, width: 380, height: 300 };
+    const menu = { x: 0, y: m.screen.height - 500, width: 380, height: 460 };
     const before = await m.screen.read(menu);
     let t0 = performance.now();
-    // Keyboard, not the pointer: XP has no absolute-pointer driver yet (VMware mouse driver pending).
-    m.input.key("ControlLeft", true); m.input.key("Escape", true); m.input.key("Escape", false); m.input.key("ControlLeft", false);
+    await h.click(m, 40, m.screen.height - 12);
     await h.waitChange(m, before, menu, 2000, 5000); t.start_menu_ms = +(performance.now() - t0).toFixed(1);
     const open = await m.screen.read(menu);
     m.input.key("Escape", true); m.input.key("Escape", false);
@@ -25,22 +25,33 @@ export default {
     await h.sleep(500);
     m.input.key("MetaLeft", true); m.input.key("KeyR", true); m.input.key("KeyR", false); m.input.key("MetaLeft", false);
     await h.sleep(1500);
-    const center = { x: 100, y: 60, width: 440, height: 300 }, b2 = await m.screen.read(center);
+    const center = { x: 100, y: 60, width: 700, height: 500 }, b2 = await m.screen.read(center);
     t0 = performance.now();
     await m.input.type("notepad\n");
     await h.waitChange(m, b2, center, 5000, 10000); t.notepad_ms = +(performance.now() - t0).toFixed(1);
     return t;
   },
-  // Bake: answer the "Found New Hardware" wizard for v86's VGA controller once, with "don't prompt again".
+  // Bake: close the Start menu that XP opens at a user's first logon, so the saved profile no longer counts as new.
   async bakePrepare(m, h) {
-    const key = (...ks) => { for (const k of ks) m.input.key(k, true); for (const k of ks.reverse()) m.input.key(k, false); };
-    key("AltLeft", "KeyT"); await h.sleep(500); key("Enter"); await h.sleep(5000);
-    key("Enter"); await h.sleep(30000); await h.shot("bake-wizard-last");
-    key("Enter"); await h.sleep(10000);
+    m.input.key("Escape", true); m.input.key("Escape", false); await h.sleep(2000);
+  },
+  // VMware's mouse driver switches to absolute mode only after the first mouse movement.
+  async afterReady(m, h) {
+    m.input.pointer.moveTo(500, 400); await h.sleep(300); m.input.pointer.moveTo(520, 420); await h.sleep(1500);
   },
   async shutdown(m, h) {
     m.input.key("ControlLeft", true); m.input.key("Escape", true); m.input.key("Escape", false); m.input.key("ControlLeft", false);
     await h.sleep(3000); await m.input.type("u"); await h.sleep(4000); await m.input.type("u");
   },
-  cursor: { area: { x: 200, y: 100, width: 400, height: 300 }, park: [700, 20], offset: [0, 0] },
+  textEcho: {
+    // Notepad does not wrap by default: break the 95 printable characters into lines of 32.
+    text: Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i)).join("").match(/.{1,32}/g).join("\n"),
+    async open(m, h) {
+      m.input.key("MetaLeft", true); m.input.key("KeyR", true); m.input.key("KeyR", false); m.input.key("MetaLeft", false);
+      await h.sleep(1500);
+      await m.input.type("notepad\n"); await h.sleep(4000); await h.settle(m, 1000);
+      return { x: 136, y: 224, width: 740, height: 60 };
+    },
+  },
+  cursor: { area: { x: 200, y: 100, width: 400, height: 300 }, park: [1000, 20], offset: [0, -1] },
 };
