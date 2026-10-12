@@ -144,7 +144,7 @@ export async function runV86(env: Env): Promise<void> {
         kernel_eips: (() => { const all = [...eipExact].sort((a, b) => b[1] - a[1]).slice(0, 12); eipExact.clear();
           const mem = emu.v86.cpu.mem8;
           return all.map(([ip, n]) => { const ph = ip & 0x1fffffff, bytes = [];
-            for (let i = -48; i < 32; i++) bytes.push(mem[ph + i].toString(16).padStart(2, "0"));
+            for (let i = -48; i < 32; i++) bytes.push((mem[ph + i] ?? 0).toString(16).padStart(2, "0"));
             return ip.toString(16) + ":" + n + ":" + bytes.join(""); }); })(),
         backdoor: cpu.devices.vmware && { seen: cpu.devices.vmware.seen, rpc: cpu.devices.vmware["rpc_log"],  en: cpu.devices.vmware.enabled, abs: cpu.devices.vmware.absolute },
         vga: (() => { const v = cpu.devices.vga, s = v.vmsvga; return { gfx: v.graphical_mode, svga: v.svga_enabled,
