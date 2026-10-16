@@ -35,7 +35,7 @@ for (const id of profiles.length ? profiles : all) {
   });
   page.on("worker", w => w.on("console", m => console.log(`[${id} worker]`, m.text())));
   page.on("pageerror", e => console.log(`[${id}] pageerror`, e.stack || e.message));
-  const q = new URLSearchParams({ profile: id, suite: opt("suite") ?? "conformance", tests: opt("tests") ?? "all", record: args.includes("--record") ? "1" : "", realclock: args.includes("--realclock") ? "1" : "", steps: opt("steps") ?? "", nopoll: opt("nopoll") ?? "", secs: opt("secs") ?? "", debug: opt("debug") ?? "", bakewait: opt("bakewait") ?? "", overlay: opt("overlay") ?? "", noready: opt("noready") ?? "", prepare: opt("prepare") ?? "" });
+  const q = new URLSearchParams({ profile: id, suite: opt("suite") ?? "conformance", tests: opt("tests") ?? "all", record: args.includes("--record") ? "1" : "", realclock: args.includes("--realclock") ? "1" : "", steps: opt("steps") ?? "", nopoll: opt("nopoll") ?? "", secs: opt("secs") ?? "", debug: opt("debug") ?? "", bakewait: opt("bakewait") ?? "", overlay: opt("overlay") ?? "", noready: opt("noready") ?? "", prepare: opt("prepare") ?? "", snap: opt("snap") ?? "" });
   await page.goto(`http://localhost:${PORT}/conformance/index.html?${q}`);
   await page.waitForFunction(() => window.RESULTS?.done, null, { timeout: 30 * 60_000, polling: 1000 });
   const res = await page.evaluate(() => window.RESULTS);

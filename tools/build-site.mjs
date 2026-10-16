@@ -7,6 +7,8 @@ const OUT = "site";
 // Disk images (the bulk of the site) can live elsewhere, e.g. an R2 bucket: see site.config.json and
 // tools/upload-disks-r2.sh. Then the site only carries code, cores, ROMs and snapshots.
 const config = fs.existsSync("site.config.json") ? JSON.parse(fs.readFileSync("site.config.json", "utf8")) : {};
+if (process.env.WEBULATOR_DISK_BASE) config.diskBase = process.env.WEBULATOR_DISK_BASE;   // e.g. a local server, for testing
+
 fs.rmSync(OUT, { recursive: true, force: true });
 const copy = (from, to = from) => { fs.mkdirSync(path.dirname(path.join(OUT, to)), { recursive: true }); fs.cpSync(from, path.join(OUT, to), { recursive: true }); };
 
@@ -18,6 +20,7 @@ fs.writeFileSync(path.join(OUT, ".nojekyll"), "");
 fs.writeFileSync(path.join(OUT, ".gitattributes"), "* -text\n");
 
 const used = new Set();
+const NO_DESKTOP_SNAPSHOT = new Set(["v86-winxp"]);   // its desktop snapshot predates the current core build
 for (const f of fs.readdirSync("profiles").filter(f => f.endsWith(".json"))) {
   const p = JSON.parse(fs.readFileSync(`profiles/${f}`, "utf8"));
   const rel = u => path.normalize(path.join("profiles", u));
@@ -30,8 +33,12 @@ for (const f of fs.readdirSync("profiles").filter(f => f.endsWith(".json"))) {
   }
   fs.mkdirSync(path.join(OUT, "profiles"), { recursive: true });
   fs.writeFileSync(path.join(OUT, "profiles", f), JSON.stringify(p, null, 2));
+  // The demo's own scenes: uploads/<profile>/demo-<name>.webusnap ships as snapshots/<profile>-<name>.webusnap.
+  const scenes = fs.existsSync(`uploads/${p.id}`) ? fs.readdirSync(`uploads/${p.id}`).filter(f => /^demo-.+\.webusnap$/.test(f)) : [];
+  for (const f of scenes) copy(`uploads/${p.id}/${f}`, `snapshots/${p.id}-${f.slice(5)}`);
   const snap = `uploads/${p.id}/s0.webusnap`;
-  if (fs.existsSync(snap)) copy(snap, `snapshots/${p.id}.webusnap`); else console.warn(`no snapshot for ${p.id}`);
+  if (NO_DESKTOP_SNAPSHOT.has(p.id)) { /* the demo only shows this profile through its scenes */ }
+  else if (fs.existsSync(snap)) copy(snap, `snapshots/${p.id}.webusnap`); else console.warn(`no snapshot for ${p.id}`);
 }
 for (const u of used) copy(u);
 // Mini vMac / macemu modules load their .wasm next to the .mjs.

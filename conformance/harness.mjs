@@ -112,9 +112,9 @@ async function bake() {
 
 // Explore: boot, then run "steps" from the URL, e.g. steps=down:185,8;shot:special;up:185,8
 async function explore() {
-  const m = await Machine.create({ profile, clock: { start: FIXED_CLOCK } });
+  const m = await Machine.create({ profile, ...(Q.get("snap") ? { snapshot: { url: Q.get("snap") } } : { clock: { start: FIXED_CLOCK } }) });
   m.on("log", t => log("  core:", t));
-  if (!Q.get("noready")) {
+  if (!Q.get("noready") && !Q.get("snap")) {
     await waitFor(async () => hooks.ready(await m.screen.read()), hooks.bootTimeout ?? 120000, 100);
     await settle(m, hooks.settle ?? 2000, 60000);
   }
@@ -129,6 +129,8 @@ async function explore() {
     if (op === "key") { for (const k of arg.split("+")) m.input.key(k, true); for (const k of arg.split("+").reverse()) m.input.key(k, false); }
     if (op === "type") await m.input.type(decodeURIComponent(arg));
     if (op === "shot") await shot(m, "explore-" + arg);
+    if (op === "keydown") m.input.key(arg, true);
+    if (op === "keyup") m.input.key(arg, false);
     if (op === "save") await putFile(arg + ".webusnap", await m.saveState());
     if (op === "debug") m._debug();
     if (op === "prof") console.log("PROF " + arg);

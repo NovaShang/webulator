@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webulator</title>
-<meta name="description" content="One browser API for WebAssembly emulators: v86, Mini vMac, Basilisk II and SheepShaver behind the same contract, held to the same conformance tests.">
+<meta name="description" content="One browser API for WebAssembly emulators: v86, Mini vMac, Basilisk II and SheepShaver behind the same contract, held to the same conformance tests. Includes Windows XP with 3D hardware acceleration (VMware SVGA II to WebGL2).">
 <script>
   // Cross-origin isolation (for SharedArrayBuffer) comes from coi-sw.js on hosts that cannot set headers.
   // Reload once the worker controls the page (controllerchange), not merely when registration resolves: the worker
@@ -82,6 +82,16 @@
   .machine[aria-current="true"] { border-bottom-color: var(--accent); background: var(--sunken); }
   .machine[aria-current="true"] small { color: var(--muted); }
 
+  .machine .badge { font: 600 10px var(--mono); letter-spacing: .06em; color: var(--accent-ink); background: var(--accent);
+    border-radius: 4px; padding: 1px 5px; margin-left: 4px; vertical-align: 1px; }
+  .feature { display: flex; gap: 12px 24px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 16px;
+    padding: 16px 20px; border: 1px solid var(--accent); border-radius: 10px; background: var(--surface); }
+  .feature h2 { margin: 0 0 2px; font-size: 17px; }
+  .feature p { margin: 0; color: var(--muted); max-width: 70ch; font-size: 14.5px; }
+  .note3d { margin: 12px 0 0; padding: 12px 16px; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface);
+    color: var(--muted); font-size: 13.5px; }
+  .note3d[hidden] { display: none; }
+  .note3d b { color: var(--ink); font-weight: 600; }
   .screen { display: grid; place-items: center; background: #000; min-height: 480px; overflow: auto; position: relative; }
   canvas { display: block; image-rendering: pixelated; max-width: 100%; height: auto; outline: none; }
   canvas:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
@@ -158,6 +168,7 @@
   <header class="top">
     <a class="mark" href="./">webulator</a>
     <nav aria-label="Project">
+      <a href="#3d">3D</a>
       <a href="#api">API</a>
       <a href="#conformance">Conformance</a>
       <a href="#cores">Cores</a>
@@ -177,6 +188,15 @@
       <div><dt>CPU families</dt><dd>3</dd></div>
       <div><dt>tests passed</dt><dd>48/48</dd></div>
     </dl>
+  </div>
+
+  <div class="feature">
+    <div>
+      <h2>New: Windows XP with 3D hardware acceleration, in the browser</h2>
+      <p>A virtual VMware SVGA II card inside the emulator turns the guest's Direct3D and OpenGL calls into WebGL2 on your
+        GPU. Open the 3D tab to see OpenArena running on an emulated Pentium.</p>
+    </div>
+    <button class="btn primary" id="try3d">Try the 3D machine</button>
   </div>
 
   <div class="demo">
@@ -202,6 +222,46 @@
       <p class="note">Click the screen to send mouse and keyboard input to the guest.</p>
     </aside>
   </div>
+
+  <p class="note3d" id="note3d" hidden><b>Windows XP · 3D accelerated.</b> Needs a desktop browser with WebGL2 and
+    SharedArrayBuffer (cross-origin isolation, set up by this page's service worker) and a GPU. First load downloads a 39 MB
+    saved state of the XP desktop; the page then starts OpenArena 0.8.8 in the guest by typing into the Run dialog, and the
+    guest streams about 130 MB of game data from disk as it loads (roughly a minute). It plays back a recorded match
+    through OpenGL 1.x, forwarded to WebGL2, and loops. The counter at the top right of the game window is the real frame
+    rate of the emulated machine: expect single digits to about fifteen frames per second, because the emulated Pentium,
+    not the GPU, is the limit. The saved state is the desktop because the host-side 3D state is not part of a snapshot.</p>
+
+  <section id="3d">
+    <h2>3D acceleration</h2>
+    <p class="lede">v86 has no 3D hardware. Webulator's v86 build adds a VMware SVGA II card with the SVGA3D protocol, so
+      the guest's own VMware display driver gets a Direct3D-capable GPU. A WebGL2 renderer in the worker executes the
+      commands, including fixed-function transform and lighting and D3D9 shaders translated to GLSL.</p>
+    <div class="split">
+      <dl class="rules">
+        <div><dt>Two paths to the GPU</dt>
+          <dd>The VMware driver (WineD3D or Mesa in the guest, slower), and API forwarding: a replacement
+            <code>d3d9.dll</code> and <code>opengl32.dll</code> hand each call to the host, which reads vertex and texture data
+            straight from guest memory. Direct3D 8 runs through d3d8to9.</dd></div>
+        <div><dt>What it needs</dt>
+          <dd>WebGL2 in a worker (OffscreenCanvas), SharedArrayBuffer, and a GPU. Without WebGL2 the tab says so and does not start.</dd></div>
+        <div><dt>Where it stops</dt>
+          <dd>The emulated CPU is the limit: about 250 to 280 MIPS, roughly a 300 to 500 MHz Pentium. Cube and volume
+            textures, user clip planes, vertex blending and GLSL are not implemented, and a window overlapping the 3D window is drawn over.</dd></div>
+      </dl>
+      <div class="table">
+        <table>
+          <thead><tr><th>Test (640×480)</th><th>Software path</th><th>Forwarded</th></tr></thead>
+          <tbody>
+            <tr><td>Quake 3 map, OpenGL</td><td class="num">158 fps</td><td class="num">329 fps</td></tr>
+            <tr><td>Quake 3 map, Direct3D 9</td><td class="num">n/a</td><td class="num">498 fps</td></tr>
+            <tr><td>OpenArena timedemo</td><td class="num">14.0 fps</td><td class="num">16.9 fps</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <p class="table-note">Measured in headless Chromium on an Apple M2. The software path is Mesa's SVGA3D OpenGL driver in the guest.
+      The live demo shows lower numbers while the page also draws the screen.</p>
+  </section>
 
   <section id="api">
     <h2>The API</h2>
@@ -276,6 +336,7 @@ m.input.pointer.button(<span class="s">0</span>, <span class="k">true</span>);
         <thead><tr><th>Core</th><th>CPU</th><th>Machine in the demo</th><th>Snapshot</th><th>License</th><th>Source changes</th></tr></thead>
         <tbody>
           <tr><td><a href="https://github.com/copy/v86">v86</a></td><td>x86</td><td>PC · Windows 98</td><td class="num">12.4 MB</td><td>BSD-2-Clause</td><td class="muted">none</td></tr>
+          <tr><td><a href="https://github.com/copy/v86">v86</a> + SVGA3D</td><td>x86</td><td>PC · Windows XP, 3D accelerated</td><td class="num">39 MB</td><td>BSD-2-Clause</td><td class="muted">VMware SVGA II device, WebGL2 renderer</td></tr>
           <tr><td><a href="https://github.com/mihaip/minivmac">Mini vMac</a></td><td>68000</td><td>Macintosh Plus · System 6.0.8</td><td class="num">0.6 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
           <tr><td><a href="https://github.com/mihaip/macemu">Basilisk II</a></td><td>68040</td><td>Quadra 650 · System 7.5.3</td><td class="num">2.0 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
           <tr><td><a href="https://github.com/mihaip/macemu">SheepShaver</a></td><td>PowerPC</td><td>Power Macintosh G3 · Mac OS 9.0.4</td><td class="num">11.1 MB</td><td>GPL-2.0</td><td class="muted">disk driver patch</td></tr>
