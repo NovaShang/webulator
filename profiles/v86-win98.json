@@ -1,0 +1,50 @@
+{
+  "id": "v86-win98",
+  "name": "PC · Windows 98",
+  "core": {
+    "adapter": "v86",
+    "module": "../assets/cores/v86/libv86.mjs",
+    "wasm": "../assets/cores/v86/v86.wasm",
+    "buildId": "sha256:aa0d0e149d6b60063b85de4871e78505637ce92821e14a9f9802c4008ba2336e"
+  },
+  "machine": {
+    "name": "PC (Pentium, PIIX, VGA/VBE)",
+    "arch": "x86",
+    "screen": {
+      "width": 720,
+      "height": 400
+    },
+    "memory": {
+      "default": 134217728,
+      "allowed": [
+        67108864,
+        134217728
+      ]
+    },
+    "hardware": {
+      "pointerButtons": 3,
+      "wheel": false,
+      "keyboard": "pc-at"
+    },
+    "files": {
+      "bios": "../assets/cores/v86/seabios.bin",
+      "vga_bios": "../assets/cores/v86/vgabios.bin"
+    }
+  },
+  "disks": [
+    {
+      "id": "hd0",
+      "source": {
+        "manifest": "https://pub-6986250a53034493aed2aee10422e09f.r2.dev/disks/win98-vbmouse/manifest.json"
+      }
+    }
+  ],
+  "coreConfig": {
+    "vgaMemory": 8388608,
+    "acpi": false,
+    "drives": {
+      "hda": "hd0"
+    },
+    "offlineNic": true
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "id": "v86-winxp",
+  "name": "PC · Windows XP",
+  "core": {
+    "adapter": "v86",
+    "module": "../assets/cores/v86-svga/libv86.mjs",
+    "wasm": "../assets/cores/v86-svga/v86.wasm",
+    "buildId": "sha256:bbaa4ecce9ee9143db2a4ce6e3cf9fef20d7972b45f5e4b840a331f26305e98e"
+  },
+  "machine": {
+    "name": "PC (Pentium, PIIX, VMware SVGA II)",
+    "arch": "x86",
+    "screen": {
+      "width": 1024,
+      "height": 768
+    },
+    "memory": {
+      "default": 268435456,
+      "allowed": [
+        268435456,
+        536870912
+      ]
+    },
+    "hardware": {
+      "pointerButtons": 3,
+      "wheel": false,
+      "keyboard": "pc-at"
+    },
+    "files": {
+      "bios": "../assets/cores/v86-svga/seabios.bin",
+      "vga_bios": "../assets/cores/v86-svga/vgabios-vmware.bin"
+    }
+  },
+  "disks": [
+    {
+      "id": "hd0",
+      "source": {
+        "manifest": "https://pub-6986250a53034493aed2aee10422e09f.r2.dev/disks/winxp/manifest.json"
+      }
+    }
+  ],
+  "coreConfig": {
+    "vgaMemory": 33554432,
+    "acpi": false,
+    "drives": {
+      "hda": "hd0"
+    },
+    "offlineNic": true,
+    "options": {
+      "vmware_svga": true
+    }
+  }
+}
