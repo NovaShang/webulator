@@ -127,8 +127,15 @@ async function launch(m, app) {
       quiet = f === last ? quiet + 1 : 0; last = f; status(`Running · loading ${app.name}'s desktop, disk read ${mb(f)}`, "running");
     }
     m.input.pointer.moveTo(500, 400); await sleep(300); m.input.pointer.moveTo(520, 420); await sleep(500);
+    const area = { x: 0, y: 400, width: 300, height: 175 };         // where XP puts the Run dialog
+    const before = await m.screen.read(area);
     m.input.key("MetaLeft", true); m.input.key("KeyR", true); m.input.key("KeyR", false); m.input.key("MetaLeft", false);
-    await sleep(1500);
+    for (let t = performance.now(); alive() && performance.now() - t < 60000; ) {   // wait for the dialog, however slow the disk is
+      await sleep(500);
+      const now = await m.screen.read(area);
+      if (now.data.some((v, i) => Math.abs(v - before.data[i]) > 40)) break;
+    }
+    await sleep(2000);
     if (!alive()) return;
     await m.input.type(app.cmd + "\n");
     c.ok("typed into the Run dialog");
