@@ -1,0 +1,3040 @@
+diff --git a/Makefile b/Makefile
+index 9aaae1e..d01e456 100644
+--- a/Makefile
++++ b/Makefile
+@@ -79,7 +79,7 @@ CARGO_FLAGS_SAFE=\
+ CARGO_FLAGS=$(CARGO_FLAGS_SAFE) -C target-feature=+bulk-memory -C target-feature=+multivalue -C target-feature=+simd128
+ 
+ CORE_FILES=cjs.js const.js io.js main.js lib.js buffer.js ide.js pci.js floppy.js \
+-	   dma.js pit.js vga.js ps2.js rtc.js uart.js parallel.js vmware.js \
++	   dma.js pit.js vga.js vmware_svga.js vmware_svga3d.js vmware_svga3d_shader.js ps2.js rtc.js uart.js parallel.js vmware.js \
+ 	   acpi.js iso9660.js \
+ 	   state.js ne2k.js sb16.js virtio.js virtio_console.js virtio_net.js virtio_balloon.js \
+ 	   bus.js log.js cpu.js \
+diff --git a/src/browser/starter.js b/src/browser/starter.js
+index 784a643..0e1294f 100644
+--- a/src/browser/starter.js
++++ b/src/browser/starter.js
+@@ -232,6 +232,7 @@ V86.prototype.continue_init = async function(emulator, options)
+     settings.load_devices = true;
+     settings.memory_size = options.memory_size || 64 * 1024 * 1024;
+     settings.vga_memory_size = options.vga_memory_size || 8 * 1024 * 1024;
++    settings.vmware_svga = !!options.vmware_svga;
+     settings.boot_order = boot_order;
+     settings.fastboot = options.fastboot || false;
+     settings.bootmenu = options.bootmenu || false;
+diff --git a/src/cpu.js b/src/cpu.js
+index 5845129..1da234f 100644
+--- a/src/cpu.js
++++ b/src/cpu.js
+@@ -381,6 +381,8 @@ CPU.prototype.wasm_patch = function()
+     this.fpu_get_sti_f64 = get_import("fpu_get_sti_f64");
+ 
+     this.translate_address_system_read = get_import("translate_address_system_read_js");
++    this.translate_address_peek = get_import("translate_address_peek_js");
++    this.jit_dirty_cache = get_import("jit_dirty_cache_js");
+ 
+     this.get_seg_cs = get_import("get_seg_cs");
+     this.get_real_eip = get_import("get_real_eip");
+@@ -1183,7 +1185,8 @@ CPU.prototype.init = function(settings, device_bus)
+ 
+         this.devices.dma = new DMA(this);
+ 
+-        this.devices.vga = new VGAScreen(this, device_bus, settings.screen, settings.vga_memory_size || 8 * 1024 * 1024);
++        this.devices.vga = new VGAScreen(this, device_bus, settings.screen, settings.vga_memory_size || 8 * 1024 * 1024,
++            { vmware_svga: settings.vmware_svga });
+ 
+         this.devices.ps2 = new PS2(this, device_bus);
+         this.devices.vmware = new VMwareMouse(this, device_bus);
+diff --git a/src/main.js b/src/main.js
+index fcc588f..151d379 100644
+--- a/src/main.js
++++ b/src/main.js
+@@ -51,7 +51,12 @@ v86.prototype.do_tick = function()
+     }
+ 
+     this.idle = false;
++    const t0 = performance.now();
+     const t = this.cpu.main_loop();
++    // Time spent running the guest (including halted-but-polling) vs. time the guest was halted at the end.
++    const st = this["tick_stats"] || (this["tick_stats"] = { "busy_ms": 0, "ticks": 0, "halted_ticks": 0 });
++    st["busy_ms"] += performance.now() - t0; st["ticks"]++;
++    if(this.cpu.in_hlt[0]) st["halted_ticks"]++;
+ 
+     this.next_tick(t);
+ };
+diff --git a/src/rust/cpu/cpu.rs b/src/rust/cpu/cpu.rs
+index 19f79b0..5b09d8b 100644
+--- a/src/rust/cpu/cpu.rs
++++ b/src/rust/cpu/cpu.rs
+@@ -2895,8 +2895,14 @@ pub unsafe fn update_cs_size(new_size: bool) {
+     }
+ }
+ 
++/// Port of the API-forwarding hypercall: usable from user mode, like VMware's backdoor.
++pub const HYPERCALL_PORT: i32 = 0x5680;
++
+ #[inline(never)]
+ pub unsafe fn test_privileges_for_io(port: i32, size: i32) -> bool {
++    if port == HYPERCALL_PORT && size == 4 {
++        return true;
++    }
+     if *protected_mode && (*cpl > getiopl() as u8 || (*flags & FLAG_VM != 0)) {
+         if !*tss_size_32 {
+             dbg_log!("#GP for port io, 16-bit TSS  port={:x} size={}", port, size);
+diff --git a/src/rust/js_api.rs b/src/rust/js_api.rs
+index 3de7b8f..c01a257 100644
+--- a/src/rust/js_api.rs
++++ b/src/rust/js_api.rs
+@@ -4,3 +4,16 @@ use crate::cpu::cpu::translate_address_system_read;
+ pub unsafe fn translate_address_system_read_js(addr: i32) -> u32 {
+     translate_address_system_read(addr).unwrap()
+ }
++
++/// Guest linear → physical address without side effects (no page fault, no accessed/dirty bits); -1 if unmapped.
++#[no_mangle]
++pub unsafe fn translate_address_peek_js(addr: i32, for_writing: bool) -> i32 {
++    match crate::cpu::cpu::translate_address(addr, for_writing, false, false, false) {
++        Ok(p) => p as i32,
++        Err(()) => -1,
++    }
++}
++
++/// The host wrote guest memory at [start, end): drop compiled code for those pages.
++#[no_mangle]
++pub fn jit_dirty_cache_js(start: u32, end: u32) { crate::jit::jit_dirty_cache(start, end) }
+diff --git a/src/rust/softfloat.rs b/src/rust/softfloat.rs
+index 6c1a4df..f3d2520 100644
+--- a/src/rust/softfloat.rs
++++ b/src/rust/softfloat.rs
+@@ -102,20 +102,135 @@ impl F80 {
+     }
+ 
+     pub fn of_f32(src: i32) -> F80 {
++        let f = f32::from_bits(src as u32);
++        if f.is_normal() || f == 0.0 {
++            if let Some(x) = F80::from_f64_exact(f as f64) {
++                return x;
++            }
++        }
+         let mut x = F80::ZERO;
+         unsafe { f32_to_extF80M(src, &mut x) };
+         x
+     }
+ 
+     pub fn of_f64(src: u64) -> F80 {
++        if let Some(x) = F80::from_f64_exact(f64::from_bits(src)) {
++            return x;
++        }
+         let mut x = F80::ZERO;
+         unsafe { f64_to_extF80M(src, &mut x) };
+         x
+     }
+     fn of_f64x(src: f64) -> F80 { F80::of_f64(f64::to_bits(src)) }
+ 
+-    pub fn to_f32(&self) -> i32 { unsafe { extF80M_to_f32(self) } }
+-    pub fn to_f64(&self) -> u64 { unsafe { extF80M_to_f64(self) } }
++    pub fn to_f32(&self) -> i32 {
++        if unsafe { softfloat_roundingMode } == 0 {
++            if let Some(x) = self.exact_f64() {
++                // One rounding step (the f64 is exact), so this matches a direct 80→32 bit rounding.
++                let f = x as f32;
++                if f.is_normal() || x == 0.0 {
++                    return f.to_bits() as i32;
++                }
++            }
++        }
++        unsafe { extF80M_to_f32(self) }
++    }
++    pub fn to_f64(&self) -> u64 {
++        if let Some(x) = self.exact_f64() {
++            return x.to_bits();
++        }
++        unsafe { extF80M_to_f64(self) }
++    }
++
++    // Fast paths. Most x87 code runs with the precision control at 53 bits (the Windows default) or
++    // 24 bits (Direct3D's default) and round-to-nearest. Then an operation on values that fit a double
++    // gives the same result in native f64 arithmetic as in SoftFloat, as long as the result is a normal
++    // number: 53-bit rounding is IEEE double rounding, and rounding a double result to 24 bits gives the
++    // correctly rounded single result because 53 >= 2*24+2. Anything else (other modes, 80-bit
++    // precision, denormals, infinities, NaNs, overflow, underflow) goes to SoftFloat. The fast path does
++    // not raise the precision (inexact) status flag.
++
++    /// The value as a double, if it is zero or a normal number with at most 53 significant bits in the
++    /// double's exponent range.
++    #[inline]
++    fn exact_f64(&self) -> Option<f64> {
++        let e = (self.sign_exponent & 0x7FFF) as i32;
++        let sign = (self.sign_exponent as u64 >> 15) << 63;
++        let m = self.mantissa;
++        if e == 0 && m == 0 {
++            return Some(f64::from_bits(sign));
++        }
++        if m >> 63 == 0 || m & 0x7FF != 0 {
++            return None;
++        }
++        let ue = e - 16383;
++        if ue < -1022 || ue > 1023 {
++            return None;
++        }
++        Some(f64::from_bits(
++            sign | ((ue + 1023) as u64) << 52 | (m << 1) >> 12,
++        ))
++    }
++
++    /// A zero or normal double as an F80 (exact).
++    #[inline]
++    fn from_f64_exact(x: f64) -> Option<F80> {
++        let bits = x.to_bits();
++        let sign = ((bits >> 63) as u16) << 15;
++        let ef = (bits >> 52 & 0x7FF) as i32;
++        let frac = bits & ((1 << 52) - 1);
++        if ef == 0 {
++            if frac == 0 {
++                return Some(F80 { mantissa: 0, sign_exponent: sign });
++            }
++            return None;
++        }
++        if ef == 0x7FF {
++            return None;
++        }
++        Some(F80 {
++            mantissa: 1 << 63 | frac << 11,
++            sign_exponent: sign | (ef - 1023 + 16383) as u16,
++        })
++    }
++
++    #[inline]
++    fn fast_op(a: &F80, b: &F80, op: u8) -> Option<F80> {
++        let precision = unsafe {
++            if softfloat_roundingMode != 0 {
++                return None;
++            }
++            extF80_roundingPrecision
++        };
++        if precision != 64 && precision != 32 {
++            return None;
++        }
++        let x = a.exact_f64()?;
++        let y = b.exact_f64()?;
++        if precision == 32 && (a.mantissa | b.mantissa) & 0xFF_FFFF_FFFF != 0 {
++            return None;
++        }
++        let mut r = match op {
++            0 => x + y,
++            1 => x - y,
++            2 => x * y,
++            _ => x / y,
++        };
++        if precision == 32 {
++            let f = r as f32;
++            if !(f.is_normal() || f == 0.0 && r == 0.0) {
++                return None;
++            }
++            r = f as f64;
++        }
++        if !r.is_normal() {
++            // Zero is exact only for an exact cancellation (add/sub) or a zero operand.
++            if r != 0.0 || op >= 2 && x != 0.0 && y != 0.0 {
++                return None;
++            }
++        }
++        F80::from_f64_exact(r)
++    }
+     fn to_f64x(&self) -> f64 { f64::from_bits(self.to_f64()) }
+ 
+     pub fn to_i32(&self) -> i32 { unsafe { extF80M_to_i32(self, softfloat_roundingMode, false) } }
+@@ -213,6 +328,9 @@ impl F80 {
+ impl std::ops::Add for F80 {
+     type Output = F80;
+     fn add(self, other: Self) -> Self {
++        if let Some(r) = F80::fast_op(&self, &other, 0) {
++            return r;
++        }
+         let mut result = F80::ZERO;
+         unsafe { extF80M_add(&self, &other, &mut result) };
+         result
+@@ -221,6 +339,9 @@ impl std::ops::Add for F80 {
+ impl std::ops::Sub for F80 {
+     type Output = F80;
+     fn sub(self, other: Self) -> Self {
++        if let Some(r) = F80::fast_op(&self, &other, 1) {
++            return r;
++        }
+         let mut result = F80::ZERO;
+         unsafe { extF80M_sub(&self, &other, &mut result) };
+         result
+@@ -237,6 +358,9 @@ impl std::ops::Neg for F80 {
+ impl std::ops::Mul for F80 {
+     type Output = F80;
+     fn mul(self, other: Self) -> Self {
++        if let Some(r) = F80::fast_op(&self, &other, 2) {
++            return r;
++        }
+         let mut result = F80::ZERO;
+         unsafe { extF80M_mul(&self, &other, &mut result) };
+         result
+@@ -245,6 +369,9 @@ impl std::ops::Mul for F80 {
+ impl std::ops::Div for F80 {
+     type Output = F80;
+     fn div(self, other: Self) -> Self {
++        if let Some(r) = F80::fast_op(&self, &other, 3) {
++            return r;
++        }
+         let mut result = F80::ZERO;
+         unsafe { extF80M_div(&self, &other, &mut result) };
+         result
+diff --git a/src/vga.js b/src/vga.js
+index 9b90f64..7705013 100644
+--- a/src/vga.js
++++ b/src/vga.js
+@@ -1,6 +1,7 @@
+ import { LOG_VGA, FLAG_VM } from "./const.js";
+ import { h } from "./lib.js";
+ import { dbg_assert, dbg_log } from "./log.js";
++import { VMwareSVGA, SVGA_IO_BASE } from "./vmware_svga.js";
+ 
+ // For Types Only
+ import { CPU } from "./cpu.js";
+@@ -59,7 +60,7 @@ const VGA_HOST_MEMORY_SPACE_SIZE = Uint32Array.from([
+  * @param {ScreenAdapter|DummyScreenAdapter} screen
+  * @param {number} vga_memory_size
+  */
+-export function VGAScreen(cpu, bus, screen, vga_memory_size)
++export function VGAScreen(cpu, bus, screen, vga_memory_size, options)
+ {
+     this.cpu = cpu;
+ 
+@@ -256,6 +257,25 @@ export function VGAScreen(cpu, bus, screen, vga_memory_size)
+     this.pci_rom_size = 0x10000;
+     this.pci_rom_address = 0xFEB00000;
+ 
++    /** @type {VMwareSVGA|null} */
++    this.vmsvga = null;
++    if(options && options.vmware_svga)
++    {
++        // Present as VMware SVGA II: BAR0 = register ports, BAR1 = VRAM (first half of the VGA memory, the
++        // existing LFB), BAR2 = command FIFO (second half). Subsystem 15AD:0405 as on real VMware hardware.
++        const half = this.vga_memory_size / 2, fifo = VGA_LFB_ADDRESS + half;
++        const space = new Uint8Array(64);
++        space.set([0xAD, 0x15, 0x05, 0x04, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
++        new DataView(space.buffer).setUint32(0x10, SVGA_IO_BASE | 1, true);
++        new DataView(space.buffer).setUint32(0x14, VGA_LFB_ADDRESS | 8, true);
++        new DataView(space.buffer).setUint32(0x18, fifo | 8, true);
++        new DataView(space.buffer).setUint16(0x2C, 0x15AD, true);
++        new DataView(space.buffer).setUint16(0x2E, 0x0405, true);
++        space.set([0x00, 0x00, 0xbe, 0xfe], 0x30);
++        this.pci_space = Array.from(space);
++        this.pci_bars = [{ size: 16 }, { size: half }, { size: half }];
++    }
++
+     this.name = "vga";
+ 
+     this.index_crtc = 0;
+@@ -386,6 +406,11 @@ export function VGAScreen(cpu, bus, screen, vga_memory_size)
+         (addr, value) => this.vga_memory_write(addr, value),
+     );
+ 
++    if(options && options.vmware_svga)
++    {
++        this.vmsvga = new VMwareSVGA(cpu, this, VGA_LFB_ADDRESS);
++    }
++
+     cpu.devices.pci.register_device(this);
+ }
+ 
+@@ -458,6 +483,7 @@ VGAScreen.prototype.get_state = function()
+     state[62] = this.dac_mask;
+     state[63] = this.character_map_select;
+     state[64] = this.font_page_ab_enabled;
++    state[65] = this.vmsvga ? this.vmsvga.get_state() : null;
+ 
+     return state;
+ };
+@@ -529,6 +555,7 @@ VGAScreen.prototype.set_state = function(state)
+     this.dac_mask = state[62] === undefined ? 0xFF : state[62];
+     this.character_map_select = state[63] === undefined ? 0 : state[63];
+     this.font_page_ab_enabled = state[64] === undefined ? 0 : state[64];
++    if(this.vmsvga && state[65]) this.vmsvga.set_state(state[65]);
+ 
+     this.screen.set_mode(this.graphical_mode);
+ 
+@@ -540,7 +567,9 @@ VGAScreen.prototype.set_state = function(state)
+     {
+         if(this.svga_enabled)
+         {
+-            this.set_size_graphical(this.svga_width, this.svga_height, this.svga_width, this.svga_height, this.svga_bpp);
++            // VMware SVGA keeps a fixed pitch wider than the visible width (see vmware_svga.js).
++            const virtual_width = this.vmsvga && this.vmsvga.enable ? this.vmsvga.pitch_pixels() : this.svga_width;
++            this.set_size_graphical(this.svga_width, this.svga_height, virtual_width, this.svga_height, this.svga_bpp);
+             this.update_layers();
+         }
+         else
+@@ -2525,6 +2554,8 @@ VGAScreen.prototype.screen_fill_buffer = function()
+         this.update_layers();
+     }
+ 
++    if(this.vmsvga) { this.vmsvga.process_fifo(); this.vmsvga.gpu.flush_presents(); }
++
+     if(this.svga_enabled)
+     {
+         let min_y = 0;
+@@ -2550,8 +2581,10 @@ VGAScreen.prototype.screen_fill_buffer = function()
+             this.cpu.svga_fill_pixel_buffer(this.svga_bpp, this.svga_offset);
+ 
+             const bytes_per_pixel = this.svga_bpp === 15 ? 2 : this.svga_bpp / 8;
+-            min_y = (((this.cpu.svga_dirty_bitmap_min_offset[0] / bytes_per_pixel | 0) - this.svga_offset) / this.svga_width | 0);
+-            max_y = (((this.cpu.svga_dirty_bitmap_max_offset[0] / bytes_per_pixel | 0) - this.svga_offset) / this.svga_width | 0) + 1;
++            // Rows are virtual_width apart (wider than svga_width when VMware SVGA uses a fixed pitch).
++            const pitch_pixels = this.vmsvga && this.vmsvga.enable ? this.virtual_width : this.svga_width;
++            min_y = (((this.cpu.svga_dirty_bitmap_min_offset[0] / bytes_per_pixel | 0) - this.svga_offset) / pitch_pixels | 0);
++            max_y = (((this.cpu.svga_dirty_bitmap_max_offset[0] / bytes_per_pixel | 0) - this.svga_offset) / pitch_pixels | 0) + 1;
+         }
+ 
+         if(min_y < max_y)
+diff --git a/src/vmware.js b/src/vmware.js
+index 6d8f052..11bde6c 100644
+--- a/src/vmware.js
++++ b/src/vmware.js
+@@ -1,4 +1,4 @@
+-import { REG_EAX, REG_EBX, REG_ECX, REG_EDX, LOG_OTHER } from "./const.js";
++import { REG_EAX, REG_EBX, REG_ECX, REG_EDX, REG_ESI, REG_EDI, LOG_OTHER } from "./const.js";
+ import { dbg_log } from "./log.js";
+ 
+ // For Types Only
+@@ -145,6 +145,7 @@ export function VMwareMouse(cpu, bus)
+ 
+     this.bus.register("mouse-click", function(data)
+     {
++        if(this.trace.length < 200) this.trace.push("CLICK" + data.join(""));
+         this.buttons =
+             (data[0] ? BUTTON_LEFT : 0) |
+             (data[1] ? BUTTON_MIDDLE : 0) |
+@@ -234,6 +235,84 @@ VMwareMouse.prototype.push_packet = function(status, x, y, wheel, move_only)
+     this.tail_is_move = move_only;
+ };
+ 
++VMwareMouse.prototype.seen = {};
++
++// GuestRPC over the low-bandwidth backdoor (BDOOR_CMD_MESSAGE): channels carry text requests from the guest
++// ("RPCI") and get a reply ("1 result" or "0 error"). Answers come from the "rpc_handler" property, if set;
++// requests are logged in "rpc_log" while we learn what the guest asks.
++VMwareMouse.prototype["rpc_log"] = [];
++VMwareMouse.prototype["rpc_handler"] = null;
++
++VMwareMouse.prototype.message = function(reg32)
++{
++    const SUCCESS = 0x00010000, DORECV = 0x00020000;
++    const sub = reg32[REG_ECX] >>> 16, id = reg32[REG_EDX] >>> 16;
++    if(!this.channels) this.channels = [];
++    const ch = this.channels[id];
++    switch(sub)
++    {
++        case 0:                                                     // open
++        {
++            let n = this.channels.findIndex(c => !c);
++            if(n < 0) n = this.channels.length;
++            this.channels[n] = { out: [], out_size: 0, reply: null, reply_pos: 0 };
++            reg32[REG_ECX] = SUCCESS; reg32[REG_EDX] = n << 16; reg32[REG_ESI] = 0x1234; reg32[REG_EDI] = 0x5678;
++            return 0;
++        }
++        case 1:                                                     // send size
++            if(!ch) break;
++            ch.out = []; ch.out_size = reg32[REG_EBX] >>> 0;
++            if(ch.out_size === 0) this.rpc_request(ch);
++            reg32[REG_ECX] = SUCCESS;
++            return 0;
++        case 2:                                                     // send payload, 4 bytes at a time
++        {
++            if(!ch) break;
++            const v = reg32[REG_EBX] >>> 0;
++            for(let i = 0; i < 4 && ch.out.length < ch.out_size; i++) ch.out.push(v >>> i * 8 & 0xFF);
++            if(ch.out.length >= ch.out_size) this.rpc_request(ch);
++            reg32[REG_ECX] = SUCCESS;
++            return 0;
++        }
++        case 3:                                                     // receive size
++            if(!ch) break;
++            if(ch.reply) { reg32[REG_ECX] = SUCCESS | DORECV; reg32[REG_EBX] = ch.reply.length; reg32[REG_EDX] = 1 << 16; }
++            else reg32[REG_ECX] = SUCCESS;
++            return 0;
++        case 4:                                                     // receive payload
++        {
++            if(!ch || !ch.reply) break;
++            let v = 0;
++            for(let i = 0; i < 4; i++) v |= (ch.reply[ch.reply_pos + i] | 0) << i * 8;
++            ch.reply_pos += 4;
++            reg32[REG_EBX] = v; reg32[REG_ECX] = SUCCESS; reg32[REG_EDX] = 2 << 16;
++            return 0;
++        }
++        case 5:                                                     // receive status (ack)
++            if(ch) { ch.reply = null; ch.reply_pos = 0; }
++            reg32[REG_ECX] = SUCCESS;
++            return 0;
++        case 6:                                                     // close
++            this.channels[id] = null;
++            reg32[REG_ECX] = SUCCESS;
++            return 0;
++    }
++    reg32[REG_ECX] = 0;
++    return 0;
++};
++
++VMwareMouse.prototype.rpc_request = function(ch)
++{
++    const text = String.fromCharCode.apply(null, ch.out);
++    let reply = this["rpc_handler"] ? this["rpc_handler"](text) : null;
++    if(reply === null && text === "info-get guestinfo.svga.enableOpenGL") reply = "1 TRUE";   // documented VMX setting
++    if(reply === null) reply = text.startsWith("log ") ? "1 " : text.startsWith("info-get ") ? "0 No value found" : "0 Unknown command";
++    if(this["rpc_log"].length < 3000) this["rpc_log"].push(text.slice(0, 120) + " => " + reply.slice(0, 40));
++    ch.reply = Array.from(reply, c => c.charCodeAt(0) & 0xFF);
++    ch.reply_pos = 0;
++};
++VMwareMouse.prototype.trace = [];
++
+ VMwareMouse.prototype.port_read32 = function()
+ {
+     const reg32 = this.cpu.reg32;
+@@ -242,8 +321,14 @@ VMwareMouse.prototype.port_read32 = function()
+         return 0xFFFFFFFF | 0;
+     }
+ 
+-    switch(reg32[REG_ECX] & 0xFFFF)
++    const cmd = reg32[REG_ECX] & 0xFFFF;
++    this.seen[cmd] = (this.seen[cmd] || 0) + 1;
++    if(cmd !== 30 && this.trace.length < 200) this.trace.push(cmd + "/" + (reg32[REG_EBX] >>> 0).toString(16) + "/q" + this.queue.length);
++    switch(cmd)
+     {
++        case 30:
++            return this.message(reg32);
++
+         case CMD_GETVERSION:
+             reg32[REG_EBX] = VMWARE_MAGIC;
+             return 6;
+diff --git a/src/vmware_svga.js b/src/vmware_svga.js
+new file mode 100644
+index 0000000..dae9dd4
+--- /dev/null
++++ b/src/vmware_svga.js
+@@ -0,0 +1,621 @@
++// VMware SVGA II (PCI 15AD:0405), built on top of the existing VGA device.
++//
++// The legacy VGA ports, the VBE "dispi" ports and the linear framebuffer stay exactly as they are; this adds the
++// SVGA II register file (an index/value pair of 32-bit ports in an I/O BAR) and the command FIFO. VRAM is the first
++// half of the VGA device's memory (BAR1, the existing LFB) and the FIFO lives in the second half (BAR2), so both are
++// plain wasm memory: guest writes cost nothing extra, and the host reads the FIFO directly.
++//
++// Reference: VMware's svga_reg.h (MIT, as shipped in Linux drivers/gpu/drm/vmwgfx/device_include) and QEMU's
++// hw/display/vmware_vga.c.
++
++import { dbg_log } from "./log.js";
++import { LOG_VGA } from "./const.js";
++
++import { SVGA3D } from "./vmware_svga3d.js";
++
++// For Types Only
++import { CPU } from "./cpu.js";
++
++export const SVGA_IO_BASE = 0x1070;
++
++const SVGA_ID_0 = 0x90000000, SVGA_ID_2 = 0x90000002;
++
++const REG = {
++    ID: 0, ENABLE: 1, WIDTH: 2, HEIGHT: 3, MAX_WIDTH: 4, MAX_HEIGHT: 5, DEPTH: 6, BITS_PER_PIXEL: 7,
++    PSEUDOCOLOR: 8, RED_MASK: 9, GREEN_MASK: 10, BLUE_MASK: 11, BYTES_PER_LINE: 12, FB_START: 13, FB_OFFSET: 14,
++    VRAM_SIZE: 15, FB_SIZE: 16, CAPABILITIES: 17, MEM_START: 18, MEM_SIZE: 19, CONFIG_DONE: 20, SYNC: 21, BUSY: 22,
++    GUEST_ID: 23, CURSOR_ID: 24, CURSOR_X: 25, CURSOR_Y: 26, CURSOR_ON: 27, HOST_BITS_PER_PIXEL: 28,
++    SCRATCH_SIZE: 29, MEM_REGS: 30, NUM_DISPLAYS: 31, PITCHLOCK: 32, IRQMASK: 33, NUM_GUEST_DISPLAYS: 34,
++    TOP: 48,
++};
++const SCRATCH_BASE = 0x40, SCRATCH_SIZE = 64, PALETTE_BASE = 0x400;
++
++export const SVGA_CAP = {
++    RECT_COPY: 1 << 1, CURSOR: 1 << 5, EIGHT_BIT_EMULATION: 1 << 8, CURSOR_BYPASS: 1 << 6, CURSOR_BYPASS_2: 1 << 7, ALPHA_CURSOR: 1 << 9,
++    THREE_D: 1 << 14, EXTENDED_FIFO: 1 << 15, MULTIMON: 1 << 16, PITCHLOCK: 1 << 17, IRQMASK: 1 << 18,
++    DISPLAY_TOPOLOGY: 1 << 19, GMR: 1 << 20, TRACES: 1 << 21, GMR2: 1 << 22, SCREEN_OBJECT_2: 1 << 23,
++};
++
++// FIFO registers, in dwords.
++export const FIFO = {
++    MIN: 0, MAX: 1, NEXT_CMD: 2, STOP: 3, CAPABILITIES: 4, FLAGS: 5, FENCE: 6, HWVERSION_3D: 7, PITCHLOCK: 8,
++    CURSOR_ON: 9, CURSOR_X: 10, CURSOR_Y: 11, CURSOR_COUNT: 12, CURSOR_LAST_UPDATED: 13, RESERVED: 14,
++    CURSOR_SCREEN_ID: 15, DEAD: 16, HWVERSION_3D_REVISED: 17, CAPS_3D: 32, CAPS_3D_LAST: 32 + 255,
++    GUEST_HWVERSION_3D: 288, FENCE_GOAL: 289, BUSY: 290, NUM_REGS: 291,
++};
++export const FIFO_CAP = { FENCE: 1 << 0, ACCELFRONT: 1 << 1, PITCHLOCK: 1 << 2, CURSOR_BYPASS_3: 1 << 4, RESERVE: 1 << 6, GMR2: 1 << 8 };
++
++const CMD = {
++    UPDATE: 1, RECT_FILL: 2, RECT_COPY: 3, DEFINE_CURSOR: 19, DEFINE_ALPHA_CURSOR: 22, UPDATE_VERBOSE: 25,
++    FRONT_ROP_FILL: 29, FENCE: 30, ESCAPE: 33, DEFINE_SCREEN: 34, DESTROY_SCREEN: 35, DEFINE_GMRFB: 36,
++    BLIT_GMRFB_TO_SCREEN: 37, BLIT_SCREEN_TO_GMRFB: 38, ANNOTATION_FILL: 39, ANNOTATION_COPY: 40,
++    DEFINE_GMR2: 41, REMAP_GMR2: 42,
++};
++// Fixed body sizes (dwords after the command id) of the 2D commands without a size field.
++const CMD_WORDS = { 1: 4, 2: 5, 3: 6, 25: 5, 29: 6, 30: 1, 35: 1, 36: 4, 37: 7, 38: 7, 39: 1, 40: 3, 41: 2 };
++const CMD_3D_FIRST = 1040, CMD_3D_LAST = 1999;
++
++const MAX_WIDTH = 1600, MAX_HEIGHT = 1200;
++const GMR_MAX_IDS = 64, GMR_MAX_PAGES = 65536;
++const GMR_FRAMEBUFFER = 0xFFFFFFFE;
++/** Pseudo-GMR of the API-forwarding path: the offset is a linear address in the calling guest process. */
++const GMR_LINEAR = 0xFFFFFFFD;
++const HYPERCALL_PORT = 0x5680;
++const HC_MAGIC = 0x44334657;            // "WF3D"
++const HC_CMD_LOG = 0x7F000001;
++
++// ---------- 3D (legacy SVGA3D) ----------
++const HWVERSION_3D = 2 << 16 | 1;                     // SVGA3D_HWVERSION_WS8_B1
++const CAPS_RECORD_DEVCAPS = 0x100;
++// SVGA3dVertexShaderVersion / SVGA3dPixelShaderVersion: NONE 0, VS 1.1/2.0/3.0 = 3/5/7, PS 1.1/1.4/2.0/3.0 = 3/9/11/13.
++const VS_VERSION = 7, PS_VERSION = 13;
++const F = new Float32Array(1), U = new Uint32Array(F.buffer);
++const float_bits = x => { F[0] = x; return U[0]; };
++const FMT = {
++    TEXTURE: 0x1, CUBETEXTURE: 0x4, OFFSCREEN_RENDERTARGET: 0x8, SAME_FORMAT_RENDERTARGET: 0x10, ZSTENCIL: 0x40,
++    ZSTENCIL_ANY_COLOR: 0x80, SAME_FORMAT_UP_TO_ALPHA_RT: 0x100, DISPLAYMODE: 0x400, ACCEL_3D: 0x800,
++    CONVERT_TO_ARGB: 0x2000, OFFSCREENPLAIN: 0x4000, MEMBEROFGROUP_ARGB: 0x80000,
++};
++const COLOR_FMT = FMT.TEXTURE | FMT.CUBETEXTURE | FMT.OFFSCREEN_RENDERTARGET | FMT.SAME_FORMAT_RENDERTARGET |
++    FMT.ACCEL_3D | FMT.CONVERT_TO_ARGB | FMT.OFFSCREENPLAIN | FMT.MEMBEROFGROUP_ARGB;
++const TEX_FMT = FMT.TEXTURE | FMT.CUBETEXTURE | FMT.OFFSCREENPLAIN;
++const DEPTH_FMT = FMT.ZSTENCIL | FMT.ZSTENCIL_ANY_COLOR;
++// SVGA3D_DEVCAP_* index → value: a D3D9-class device (SM 3.0, 8 lights, 6 clip planes, DXT, D16/D24S8).
++const DEVCAPS = [
++    [0, 1], [1, 8], [2, 8], [3, 6], [4, VS_VERSION], [5, VS_VERSION ? 1 : 0], [6, PS_VERSION], [7, PS_VERSION ? 1 : 0], [8, 4], [9, 0], [10, 0], [11, 4],
++    [12, 1], [13, 1], [14, 1], [15, 1], [16, 1], [17, float_bits(64)], [18, 16], [19, 4096], [20, 4096],
++    [21, 256], [22, 8192], [23, 4096], [24, 16], [25, 0xFFFFF], [26, 0xFFFFF], [27, 512], [28, 512],
++    [29, 32], [30, 32], [31, (1 << 26) - 1],
++    [32, COLOR_FMT | FMT.DISPLAYMODE], [33, COLOR_FMT | FMT.SAME_FORMAT_UP_TO_ALPHA_RT], [35, COLOR_FMT],
++    [36, COLOR_FMT], [37, COLOR_FMT], [38, COLOR_FMT | FMT.DISPLAYMODE], [39, TEX_FMT], [40, TEX_FMT],
++    [41, TEX_FMT], [42, TEX_FMT], [43, DEPTH_FMT], [44, DEPTH_FMT], [45, DEPTH_FMT],
++    [46, TEX_FMT], [47, TEX_FMT], [48, TEX_FMT], [49, TEX_FMT], [50, TEX_FMT],
++    [63, 4], [64, 4], [77, 256], [78, 32768],
++];
++
++/**
++ * @constructor
++ * @param {CPU} cpu
++ * @param {Object} vga the VGAScreen this extends
++ * @param {number} lfb_address physical address of VRAM (BAR1)
++ */
++export function VMwareSVGA(cpu, vga, lfb_address)
++{
++    this.cpu = cpu;
++    this.vga = vga;
++    this.vram_size = vga.vga_memory_size / 2;
++    this.fifo_offset = this.vram_size;                 // byte offset of the FIFO within the VGA memory
++    this.fifo_size = Math.min(this.vram_size, 2 * 1024 * 1024);
++    this.lfb_address = lfb_address;
++    this.fifo_address = lfb_address + this.fifo_offset;
++
++    this.index = 0;
++    this.id = SVGA_ID_2;
++    this.enable = 0;
++    this.config_done = 0;
++    this.width = 1024;
++    this.height = 768;
++    this.bpp = 32;
++    this.guest_id = 0;
++    this.scratch = new Int32Array(SCRATCH_SIZE);
++    this.palette = new Uint8Array(256 * 3);
++
++    // Hooks for the 3D layer (and a command log while we learn what the XP driver sends).
++    this.capabilities = SVGA_CAP.EXTENDED_FIFO | SVGA_CAP.THREE_D | SVGA_CAP.EIGHT_BIT_EMULATION | SVGA_CAP.GMR | SVGA_CAP.GMR2;
++    this.fifo_capabilities = FIFO_CAP.FENCE | FIFO_CAP.RESERVE | FIFO_CAP.GMR2;
++    /** Guest memory regions: id → guest physical page numbers. */
++    this.gmrs = new Map();
++    this.gmr_id = 0;
++    this.hw_version_3d = HWVERSION_3D;
++    /** 3D command log: counts per id, and the first commands in order (while we learn the driver). */
++    this.stats3d = Object.create(null);
++    this.trace3d = [];
++    /** @type {function(number, Uint32Array, number, number)|null} */
++    this.on_3d_command = null;
++    this.stats = Object.create(null);
++    this.reg_log = [];
++
++    const io = cpu.io;
++    const base = SVGA_IO_BASE;
++    io.register_read(base, this, undefined, undefined, () => this.index);
++    io.register_write(base, this, undefined, undefined, value => { this.index = value >>> 0; });
++    io.register_read(base + 1, this, undefined, undefined, () => this.read_reg(this.index));
++    io.register_write(base + 1, this, undefined, undefined, value => this.write_reg(this.index, value >>> 0));
++    io.register_read(base + 2, this, () => 0, () => 0, () => 0);              // BIOS port
++    io.register_read(base + 8, this, () => 0, () => 0, () => 0);              // IRQ status
++    io.register_write(base + 8, this, undefined, undefined, () => {});
++
++    // API forwarding: a user-mode Direct3D runtime in the guest sends SVGA3D commands with `out HYPERCALL_PORT, eax`.
++    io.register_write(HYPERCALL_PORT, this, undefined, undefined, value => this.hypercall(value >>> 0));
++    this.hc_stats = { calls: 0, commands: 0, faults: 0, bytes: 0 };
++    this.hc_log = [];
++
++    this.gpu = new SVGA3D(this);
++    this.init_fifo_registers();
++}
++
++VMwareSVGA.prototype.fifo = function()
++{
++    const buf = this.cpu.wasm_memory.buffer;
++    if(!this.fifo_view || this.fifo_view.buffer !== buf)
++    {
++        this.fifo_view = new Uint32Array(buf, this.vga.svga_memory.byteOffset + this.fifo_offset, this.fifo_size / 4);
++    }
++    return this.fifo_view;
++};
++
++
++VMwareSVGA.prototype.init_fifo_registers = function()
++{
++    const f = this.fifo();
++    f[FIFO.CAPABILITIES] = this.fifo_capabilities;
++    f[FIFO.FLAGS] = 0;
++    f[FIFO.HWVERSION_3D] = this.hw_version_3d;
++    f[FIFO.HWVERSION_3D_REVISED] = this.hw_version_3d;
++    f[FIFO.BUSY] = 0;
++    // 3D caps: one DEVCAPS record of {index, value} pairs, then an empty record.
++    let o = FIFO.CAPS_3D;
++    f[o++] = 2 + DEVCAPS.length * 2; f[o++] = CAPS_RECORD_DEVCAPS;
++    for(const [i, v] of DEVCAPS) { f[o++] = i; f[o++] = v >>> 0; }
++    f[o++] = 0; f[o++] = 0;
++};
++
++// The XP driver lays rows out at the maximum width (it never reads BYTES_PER_LINE), so the pitch is fixed.
++VMwareSVGA.prototype.bytes_per_line = function()
++{
++    return MAX_WIDTH * 4;              // fixed in bytes ("pitchlock"), whatever the depth
++};
++
++VMwareSVGA.prototype.read_reg = function(index)
++{
++    if(this.reg_log.length < 4000 && index !== REG.BUSY) this.reg_log.push("r" + index);
++    switch(index)
++    {
++        case REG.ID: return this.id;
++        case REG.ENABLE: return this.enable;
++        case REG.WIDTH: return this.width;
++        case REG.HEIGHT: return this.height;
++        case REG.MAX_WIDTH: return MAX_WIDTH;
++        case REG.MAX_HEIGHT: return MAX_HEIGHT;
++        case REG.DEPTH: return this.bpp === 32 ? 24 : this.bpp;
++        case REG.BITS_PER_PIXEL: return this.bpp;
++        case REG.HOST_BITS_PER_PIXEL: return 32;
++        case REG.PSEUDOCOLOR: return this.bpp === 8 ? 1 : 0;
++        case REG.RED_MASK: return this.bpp === 16 ? 0xF800 : this.bpp === 15 ? 0x7C00 : 0xFF0000;
++        case REG.GREEN_MASK: return this.bpp === 16 ? 0x07E0 : this.bpp === 15 ? 0x03E0 : 0x00FF00;
++        case REG.BLUE_MASK: return this.bpp === 16 || this.bpp === 15 ? 0x001F : 0x0000FF;
++        case REG.BYTES_PER_LINE: return this.bytes_per_line();
++        case REG.FB_START: return this.lfb_address;
++        case REG.FB_OFFSET: return 0;
++        case REG.VRAM_SIZE: return this.vram_size;
++        case REG.FB_SIZE: return this.bytes_per_line() * this.height;
++        case REG.CAPABILITIES: return this.capabilities;
++        case REG.MEM_START: return this.fifo_address;
++        case REG.MEM_SIZE: return this.fifo_size;
++        case REG.CONFIG_DONE: return this.config_done;
++        case REG.SYNC: return 0;
++        case REG.BUSY: this.process_fifo(); return 0;
++        case REG.GUEST_ID: return this.guest_id;
++        case REG.SCRATCH_SIZE: return SCRATCH_SIZE;
++        case REG.MEM_REGS: return FIFO.NUM_REGS;
++        case REG.NUM_DISPLAYS: return 1;
++        case REG.PITCHLOCK: return 0;
++        case REG.IRQMASK: return 0;
++        case REG.NUM_GUEST_DISPLAYS: return 1;
++        case 47: return 256 * 1024 * 1024;                      // SVGA_REG_MEMORY_SIZE: host memory for surfaces
++        case 41: return this.gmr_id;                            // GMR_ID
++        case 43: return GMR_MAX_IDS;                            // GMR_MAX_IDS
++        case 44: return 4096;                                   // GMR_MAX_DESCRIPTOR_LENGTH
++        case 46: return GMR_MAX_PAGES;                          // GMRS_MAX_PAGES
++    }
++    if(index >= SCRATCH_BASE && index < SCRATCH_BASE + SCRATCH_SIZE) return this.scratch[index - SCRATCH_BASE];
++    if(index >= PALETTE_BASE && index < PALETTE_BASE + 768) return this.palette[index - PALETTE_BASE];
++    dbg_log("vmware svga: read of unknown register " + index, LOG_VGA);
++    return 0;
++};
++
++VMwareSVGA.prototype.write_reg = function(index, value)
++{
++    if(this.reg_log.length < 4000) this.reg_log.push("w" + index + "=" + value);
++    switch(index)
++    {
++        case REG.ID:
++            this.id = value >= SVGA_ID_0 && value <= SVGA_ID_2 ? value : SVGA_ID_2;
++            return;
++        case REG.ENABLE:
++            this.enable = value & 1;
++            this.update_mode();
++            return;
++        case REG.WIDTH:
++            this.width = Math.max(1, Math.min(value, MAX_WIDTH));
++            this.update_mode();
++            return;
++        case REG.HEIGHT:
++            this.height = Math.max(1, Math.min(value, MAX_HEIGHT));
++            this.update_mode();
++            return;
++        case REG.BITS_PER_PIXEL:
++            if(value === 8 || value === 15 || value === 16 || value === 24 || value === 32) this.bpp = value;
++            this.update_mode();
++            return;
++        case REG.CONFIG_DONE:
++            this.config_done = value & 1;
++            if(this.config_done) this.init_fifo_registers();
++            return;
++        case REG.SYNC:
++            this.process_fifo();
++            return;
++        case REG.GUEST_ID:
++            this.guest_id = value;
++            return;
++        case 41:                                                // GMR_ID
++            this.gmr_id = value;
++            return;
++        case 42:                                                // GMR_DESCRIPTOR: define the GMR from a page list
++            this.define_gmr_from_descriptor(this.gmr_id, value);
++            return;
++        case REG.CURSOR_ID: case REG.CURSOR_X: case REG.CURSOR_Y: case REG.CURSOR_ON:
++        case REG.PITCHLOCK: case REG.IRQMASK: case REG.NUM_GUEST_DISPLAYS:
++            return;
++    }
++    if(index >= SCRATCH_BASE && index < SCRATCH_BASE + SCRATCH_SIZE) { this.scratch[index - SCRATCH_BASE] = value; return; }
++    if(index >= PALETTE_BASE && index < PALETTE_BASE + 768)
++    {
++        this.palette[index - PALETTE_BASE] = value;
++        const i = (index - PALETTE_BASE) / 3 | 0, p = this.palette;
++        this.vga.vga256_palette[i] = p[i * 3] << 16 | p[i * 3 + 1] << 8 | p[i * 3 + 2];
++        return;
++    }
++    dbg_log("vmware svga: write of unknown register " + index + " = " + value, LOG_VGA);
++};
++
++VMwareSVGA.prototype.pitch_pixels = function()
++{
++    return this.bytes_per_line() / ((this.bpp + 7) >> 3);
++};
++
++// Show the SVGA framebuffer through the VGA device's SVGA path while enabled; hand back to VGA when disabled.
++VMwareSVGA.prototype.update_mode = function()
++{
++    const vga = this.vga;
++    if(this.enable)
++    {
++        vga.svga_enabled = true;
++        vga.svga_width = this.width;
++        vga.svga_height = this.height;
++        vga.svga_bpp = this.bpp;
++        vga.svga_offset = vga.svga_offset_x = vga.svga_offset_y = 0;
++        vga.graphical_mode = true;
++        vga.screen.set_mode(true);
++        vga.set_size_graphical(this.width, this.height, this.pitch_pixels(), this.height, this.bpp);
++        vga.complete_redraw();
++    }
++    else if(vga.svga_enabled)
++    {
++        vga.svga_enabled = false;
++        const is_graphical = (vga.attribute_mode & 0x1) !== 0;
++        vga.graphical_mode = is_graphical;
++        vga.screen.set_mode(is_graphical);
++        vga.update_vga_size();
++        vga.complete_redraw();
++    }
++};
++
++/**
++ * Run every complete command in the FIFO. Called on SYNC, on BUSY reads and once per frame.
++ */
++VMwareSVGA.prototype.process_fifo = function()
++{
++    if(!this.enable || !this.config_done) return;
++    const f = this.fifo();
++    const min = f[FIFO.MIN] >>> 0, max = f[FIFO.MAX] >>> 0;
++    if(min < FIFO.NUM_REGS * 4 || max > this.fifo_size || min >= max) return;
++    const span = max - min;
++
++    for(let guard = 0; guard < 100000; guard++)
++    {
++        const next = f[FIFO.NEXT_CMD] >>> 0, stop = f[FIFO.STOP] >>> 0;
++        if(next === stop) break;
++        const avail = (next - stop + span) % span;
++        let pos = stop;
++        const word = () => { const v = f[pos >> 2]; pos += 4; if(pos >= max) pos = min; return v; };
++        const need = n => avail >= n * 4;
++
++        const id = f[stop >> 2];
++        let words;                                              // total dwords incl. the id, or -1 if incomplete
++        if(id >= CMD_3D_FIRST && id <= CMD_3D_LAST)
++        {
++            if(!need(2)) break;
++            word(); const size = word();
++            words = 2 + (size + 3 >> 2);
++            if(!need(words)) break;
++            this.handle_3d(f, id, stop, size, min, max);
++        }
++        else if(id === CMD.DEFINE_CURSOR)
++        {
++            if(!need(8)) break;
++            word(); word(); word(); word(); const w = word(), h = word(), and_depth = word(), xor_depth = word();
++            const pitch = d => ((w * d + 31) >> 5) * h;
++            words = 8 + pitch(and_depth) + pitch(xor_depth);
++        }
++        else if(id === CMD.DEFINE_ALPHA_CURSOR)
++        {
++            if(!need(6)) break;
++            word(); word(); word(); word(); const w = word(), h = word();
++            words = 6 + w * h;
++        }
++        else if(id === CMD.ESCAPE)
++        {
++            if(!need(3)) break;
++            word(); word(); const size = word();
++            words = 3 + (size + 3 >> 2);
++        }
++        else if(id === CMD.DEFINE_SCREEN)
++        {
++            if(!need(2)) break;
++            word(); const size = word();
++            words = 1 + (size + 3 >> 2);
++        }
++        else if(id === CMD.REMAP_GMR2)
++        {
++            if(!need(5)) break;
++            word(); const gmr = word(), flags = word(), first = word(), pages = word();
++            const ppn64 = flags & 2, per = ppn64 ? 2 : 1;
++            const list = flags & 1 ? 2 : flags & 4 ? per : pages * per;    // VIA_GMR / SINGLE_PPN / inline list
++            words = 5 + list;
++            if(!need(words)) break;
++            const ppns = [];
++            if(flags & 1)
++            {
++                const via = word(), off = word();
++                const raw = this.guest_read(via, off, pages * per * 4);
++                const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
++                for(let i = 0; i < pages; i++) ppns.push(dv.getUint32(i * per * 4, true));
++            }
++            else if(flags & 4)
++            {
++                const ppn = word(); if(ppn64) word();
++                for(let i = 0; i < pages; i++) ppns.push(ppn);
++            }
++            else
++            {
++                for(let i = 0; i < pages; i++) { ppns.push(word()); if(ppn64) word(); }
++            }
++            const g = this.gmrs.get(gmr);
++            if(g) for(let i = 0; i < ppns.length && first + i < g.length; i++) g[first + i] = ppns[i];
++        }
++        else if(CMD_WORDS[id] !== undefined)
++        {
++            words = 1 + CMD_WORDS[id];
++            if(!need(words)) break;
++            pos = stop;
++            word();
++            if(id === CMD.UPDATE || id === CMD.UPDATE_VERBOSE)
++            {
++                const x = word(), y = word(), w = word(), h = word();
++                this.update_rect(x, y, w, h);
++            }
++            else if(id === CMD.FENCE)
++            {
++                f[FIFO.FENCE] = word();
++            }
++            else if(id === CMD.DEFINE_GMR2)
++            {
++                const gmr = word(), pages = word();
++                if(pages) this.gmrs.set(gmr, new Uint32Array(pages)); else this.gmrs.delete(gmr);
++            }
++        }
++        else
++        {
++            // Unknown command: we cannot know its length, so the FIFO is unusable from here on.
++            dbg_log("vmware svga: unknown FIFO command " + id + "; stopping", LOG_VGA);
++            this.stats["unknown " + id] = (this.stats["unknown " + id] || 0) + 1;
++            f[FIFO.STOP] = next;
++            break;
++        }
++        if(!need(words)) break;
++        this.stats[id] = (this.stats[id] || 0) + 1;
++        f[FIFO.STOP] = min + ((stop - min + words * 4) % span);
++    }
++};
++
++// ---------- guest memory regions ----------
++
++VMwareSVGA.prototype.define_gmr_from_descriptor = function(id, ppn)
++{
++    if(!ppn) { this.gmrs.delete(id); return; }
++    const mem = this.cpu.mem8, pages = [];
++    for(let guard = 0; guard < 100000; guard++)
++    {
++        const dv = new DataView(mem.buffer, mem.byteOffset + ppn * 4096, 4096);
++        let next = 0;
++        for(let o = 0; o + 8 <= 4096; o += 8)
++        {
++            const p = dv.getUint32(o, true), n = dv.getUint32(o + 4, true);
++            if(!n) { next = p; break; }
++            for(let i = 0; i < n && pages.length < GMR_MAX_PAGES; i++) pages.push(p + i);
++        }
++        if(!next) break;
++        ppn = next;
++    }
++    this.gmrs.set(id, Uint32Array.from(pages));
++};
++
++// ---------- guest linear memory (API forwarding) ----------
++
++/** Copy len bytes from guest linear address addr into out (at out_offset). Returns false on an unmapped page and
++ * records it in this.hc_fault. */
++VMwareSVGA.prototype.linear_read = function(addr, len, out, out_offset)
++{
++    const cpu = this.cpu, mem = cpu.mem8;
++    const raw = new Uint8Array(mem.buffer, mem.byteOffset, mem.length);
++    for(let done = 0; done < len;)
++    {
++        const at = addr + done >>> 0, n = Math.min(4096 - (at & 4095), len - done);
++        const phys = cpu.translate_address_peek(at | 0, false);
++        if(phys < 0 || phys + n > raw.length) { this.hc_fault = at; return false; }
++        out.set(raw.subarray(phys, phys + n), out_offset + done);
++        done += n;
++    }
++    return true;
++};
++
++VMwareSVGA.prototype.linear_write = function(addr, data)
++{
++    const cpu = this.cpu, mem = cpu.mem8;
++    const raw = new Uint8Array(mem.buffer, mem.byteOffset, mem.length);
++    for(let done = 0; done < data.length;)
++    {
++        const at = addr + done >>> 0, n = Math.min(4096 - (at & 4095), data.length - done);
++        const phys = cpu.translate_address_peek(at | 0, true);
++        if(phys < 0 || phys + n > raw.length) { this.hc_fault = at; return false; }
++        raw.set(data.subarray(done, done + n), phys);
++        cpu.jit_dirty_cache(phys, phys + n);
++        done += n;
++    }
++    return true;
++};
++
++/**
++ * One hypercall. eax points at a control block in the caller's address space:
++ *   [0] magic  [1] command buffer address  [2] command bytes  [3] status (0 ok, 1 page fault)
++ *   [4] faulting address  [5] bytes of commands completed
++ * Commands use the FIFO's 3D layout (id, byte size, body). On an unmapped page the call stops before the command
++ * that touched it; the guest touches the page and resubmits the rest.
++ */
++VMwareSVGA.prototype["hc_debug"] = function()
++{
++    return { "calls": this.hc_stats.calls, "commands": this.hc_stats.commands, "faults": this.hc_stats.faults,
++        "bytes": this.hc_stats.bytes, "log": this.hc_log.slice(-40) };
++};
++
++VMwareSVGA.prototype.hypercall = function(ctrl)
++{
++    this.hc_stats.calls++;
++    const head = new Uint8Array(24);
++    this.hc_fault = -1;
++    if(!this.linear_read(ctrl, 24, head, 0)) return;
++    const hv = new Uint32Array(head.buffer);
++    if(hv[0] !== HC_MAGIC) return;
++    const addr = hv[1], len = hv[2] & ~3;
++    const reply = (status, fault, done) => { hv[3] = status; hv[4] = fault; hv[5] = done; this.linear_write(ctrl, head); };
++    const bytes = new Uint8Array(len);
++    if(!this.linear_read(addr, len, bytes, 0)) { this.hc_stats.faults++; return reply(1, this.hc_fault >>> 0, 0); }
++    const words = new Uint32Array(bytes.buffer);
++    this.hc_stats.bytes += len;
++    let pos = 0;
++    while(pos + 8 <= len)
++    {
++        const id = words[pos >> 2], size = words[(pos >> 2) + 1];
++        if(pos + 8 + size > len) break;
++        const body = words.subarray((pos >> 2) + 2, (pos + 8 + size) >> 2);
++        this.hc_fault = -1;
++        if(id === HC_CMD_LOG)
++        {
++            const text = new TextDecoder().decode(bytes.subarray(pos + 8, pos + 8 + size)).replace(/\0+$/, "");
++            if(this.hc_log.length < 400) this.hc_log.push(text);
++        }
++        else
++        {
++            this.stats3d[id] = (this.stats3d[id] || 0) + 1;
++            this.gpu.command(id, body);         // a view of this call's own copy of the commands
++        }
++        if(this.hc_fault !== -1) { this.hc_stats.faults++; return reply(1, this.hc_fault >>> 0, pos); }
++        this.hc_stats.commands++;
++        pos += 8 + size;
++    }
++    reply(0, 0, pos);
++};
++
++/** Read len bytes at offset in a GMR (or VRAM); returns a copy. */
++VMwareSVGA.prototype.guest_read = function(gmr, offset, len)
++{
++    const out = new Uint8Array(len);
++    if(gmr === GMR_LINEAR) { this.linear_read(offset, len, out, 0); return out; }
++    if(gmr === GMR_FRAMEBUFFER) { out.set(this.vga.svga_memory.subarray(offset, offset + len)); return out; }
++    const pages = this.gmrs.get(gmr), mem = this.cpu.mem8;
++    if(!pages) return out;
++    for(let done = 0; done < len;)
++    {
++        const at = offset + done, page = at >>> 12, within = at & 4095, n = Math.min(4096 - within, len - done);
++        if(page >= pages.length) break;
++        const phys = pages[page] * 4096 + within;
++        if(phys + n <= mem.length) out.set(mem.subarray(phys, phys + n), done);
++        done += n;
++    }
++    return out;
++};
++
++/** Write bytes at offset in a GMR (or VRAM). */
++VMwareSVGA.prototype.guest_write = function(gmr, offset, data)
++{
++    if(gmr === GMR_LINEAR) { this.linear_write(offset, data); return; }
++    if(gmr === GMR_FRAMEBUFFER) { this.vga.svga_memory.set(data, offset); return; }
++    const pages = this.gmrs.get(gmr), mem = this.cpu.mem8;
++    if(!pages) return;
++    for(let done = 0; done < data.length;)
++    {
++        const at = offset + done, page = at >>> 12, within = at & 4095, n = Math.min(4096 - within, data.length - done);
++        if(page >= pages.length) break;
++        const phys = pages[page] * 4096 + within;
++        if(phys + n <= mem.length) mem.set(data.subarray(done, done + n), phys);
++        done += n;
++    }
++};
++
++VMwareSVGA.prototype.handle_3d = function(f, id, pos, size, min, max)
++{
++    this.stats3d[id] = (this.stats3d[id] || 0) + 1;
++    if(this.trace3d.length < 3000)
++    {
++        const words = [];
++        let p = pos + 8;
++        for(let i = 0; i < Math.min(size >> 2, 40); i++) { words.push((f[p >> 2] >>> 0).toString(16)); p += 4; if(p >= max) p = min; }
++        this.trace3d.push(id + ":" + size + ":" + words.join(","));
++    }
++    // Copy the body out of the ring (it may wrap) and hand it to the renderer.
++    const body = new Uint32Array(size >> 2);
++    let p = pos + 8;
++    for(let i = 0; i < body.length; i++) { body[i] = f[p >> 2]; p += 4; if(p >= max) p = min; }
++    this.gpu.command(id, body);
++};
++
++VMwareSVGA.prototype.update_rect = function(x, y, w, h)
++{
++    // Nothing to do: every guest write to VRAM already marks its page dirty for the next frame.
++};
++
++VMwareSVGA.prototype.get_state = function()
++{
++    return [this.index, this.id, this.enable, this.config_done, this.width, this.height, this.bpp, this.guest_id,
++        this.scratch, this.palette, Array.from(this.gmrs, ([id, pages]) => [id, pages])];
++};
++
++VMwareSVGA.prototype.set_state = function(s)
++{
++    [this.index, this.id, this.enable, this.config_done, this.width, this.height, this.bpp, this.guest_id] = s;
++    this.scratch.set(s[8]);
++    this.palette.set(s[9]);
++    this.gmrs = new Map((s[10] || []).map(([id, pages]) => [id, Uint32Array.from(pages)]));
++    if(this.enable) this.update_mode();
++};
+diff --git a/src/vmware_svga3d.js b/src/vmware_svga3d.js
+new file mode 100644
+index 0000000..85edf66
+--- /dev/null
++++ b/src/vmware_svga3d.js
+@@ -0,0 +1,1495 @@
++// Legacy SVGA3D (the pre-DX10 command set of VMware SVGA II) rendered with WebGL2.
++//
++// Scope: what the Windows XP VMware driver (a Direct3D 7-level HAL) sends. Vertices arrive pre-transformed
++// (POSITIONT), so the host work is rasterisation, the texture-stage combiners and the render states. Surfaces are
++// GL textures (colour, RGBA8) or depth-stencil textures; vertex and index buffers keep a CPU copy and are uploaded
++// to GL when used. Data moves between the guest and the host through VRAM (gmrId = framebuffer). PRESENT reads the
++// rendered image back into the VMware framebuffer, so the rest of the display path (and snapshots) is unchanged.
++//
++// Coordinates: GL row y holds Direct3D row y everywhere (uploads, render targets, readback), so nothing is flipped;
++// the mirror only reverses the triangle winding, which the cull setup accounts for.
++//
++// Enum values: VMware's svga3d_types.h / svga3d_cmd.h (MIT, Linux drivers/gpu/drm/vmwgfx/device_include).
++
++import { dbg_log } from "./log.js";
++import { LOG_VGA } from "./const.js";
++import { translate_shader, SHADER_VS, SHADER_PS } from "./vmware_svga3d_shader.js";
++
++const INVALID_ID = 0xFFFFFFFF;
++// Surface flag from the API-forwarding runtimes: a scratch buffer that is written in small pieces, each used by the
++// draws right after it. Each piece gets its own GL buffer: updating a large GL buffer that queued draws still use
++// makes the browser copy all of it.
++const SURFACE_STREAM = 0x80000000;
++const STREAM_POOL = 512;
++const GMR_FRAMEBUFFER = 0xFFFFFFFE;
++
++const CMD = {
++    SURFACE_DEFINE: 1040, SURFACE_DESTROY: 1041, SURFACE_COPY: 1042, SURFACE_STRETCHBLT: 1043, SURFACE_DMA: 1044,
++    CONTEXT_DEFINE: 1045, CONTEXT_DESTROY: 1046, SETTRANSFORM: 1047, SETZRANGE: 1048, SETRENDERSTATE: 1049,
++    SETRENDERTARGET: 1050, SETTEXTURESTATE: 1051, SETMATERIAL: 1052, SETLIGHTDATA: 1053, SETLIGHTENABLED: 1054,
++    SETVIEWPORT: 1055, SETCLIPPLANE: 1056, CLEAR: 1057, PRESENT: 1058, SHADER_DEFINE: 1059, SHADER_DESTROY: 1060,
++    SET_SHADER: 1061, SET_SHADER_CONST: 1062, DRAW_PRIMITIVES: 1063, SETSCISSORRECT: 1064, BEGIN_QUERY: 1065,
++    END_QUERY: 1066, WAIT_FOR_QUERY: 1067, PRESENT_READBACK: 1068, BLIT_SURFACE_TO_SCREEN: 1069,
++    SURFACE_DEFINE_V2: 1070, GENERATE_MIPMAPS: 1071, ACTIVATE_SURFACE: 1080, DEACTIVATE_SURFACE: 1081,
++    SURFACE_DMA_FORMAT: 0x7F000002,         // API forwarding: [guest format, ...SURFACE_DMA]
++};
++
++const FMT = {
++    X8R8G8B8: 1, A8R8G8B8: 2, R5G6B5: 3, X1R5G5B5: 4, A1R5G5B5: 5, A4R4G4B4: 6, Z_D32: 7, Z_D16: 8, Z_D24S8: 9,
++    Z_D15S1: 10, LUMINANCE8: 11, LUMINANCE4_ALPHA4: 12, LUMINANCE16: 13, LUMINANCE8_ALPHA8: 14, DXT1: 15, DXT2: 16,
++    DXT3: 17, DXT4: 18, DXT5: 19, ALPHA8: 32, BUFFER: 37, Z_D24X8: 38,
++    // Not SVGA3D: byte orders of OpenGL client data, used by the API-forwarding OpenGL runtime.
++    RGBA8: 0x1001, RGB8: 0x1002, BGR8: 0x1003, INTENSITY8: 0x1004,
++};
++const DEPTH_FORMATS = new Set([FMT.Z_D32, FMT.Z_D16, FMT.Z_D24S8, FMT.Z_D15S1, FMT.Z_D24X8]);
++const DXT = { [FMT.DXT1]: 8, [FMT.DXT2]: 16, [FMT.DXT3]: 16, [FMT.DXT4]: 16, [FMT.DXT5]: 16 };   // bytes per 4×4 block
++const BYTES_PER_PIXEL = {
++    [FMT.X8R8G8B8]: 4, [FMT.A8R8G8B8]: 4, [FMT.R5G6B5]: 2, [FMT.X1R5G5B5]: 2, [FMT.A1R5G5B5]: 2, [FMT.A4R4G4B4]: 2,
++    [FMT.LUMINANCE8]: 1, [FMT.LUMINANCE4_ALPHA4]: 1, [FMT.LUMINANCE16]: 2, [FMT.LUMINANCE8_ALPHA8]: 2,
++    [FMT.ALPHA8]: 1, [FMT.RGBA8]: 4, [FMT.RGB8]: 3, [FMT.BGR8]: 3, [FMT.INTENSITY8]: 1, [FMT.Z_D32]: 4, [FMT.Z_D16]: 2, [FMT.Z_D24S8]: 4, [FMT.Z_D15S1]: 2, [FMT.Z_D24X8]: 4,
++};
++
++// Render states (SVGA3dRenderStateName) used here.
++const RS = {
++    LIGHTINGENABLE: 9, NORMALIZENORMALS: 10, AMBIENT: 26, VERTEXMATERIALENABLE: 48, DIFFUSEMATERIALSOURCE: 49,
++    SPECULARMATERIALSOURCE: 50, AMBIENTMATERIALSOURCE: 51, EMISSIVEMATERIALSOURCE: 52, LOCALVIEWER: 54,
++    RANGEFOGENABLE: 46,
++    ZENABLE: 1, ZWRITEENABLE: 2, ALPHATESTENABLE: 3, BLENDENABLE: 5, FOGENABLE: 6, SPECULARENABLE: 7,
++    STENCILENABLE: 8, STENCILREF: 13, STENCILMASK: 14, STENCILWRITEMASK: 15, FOGSTART: 16, FOGEND: 17,
++    FOGDENSITY: 18, FOGCOLOR: 25, FOGMODE: 28, SHADEMODE: 30, SRCBLEND: 32, DSTBLEND: 33, BLENDEQUATION: 34,
++    CULLMODE: 35, ZFUNC: 36, ALPHAFUNC: 37, STENCILFUNC: 38, STENCILFAIL: 39, STENCILZFAIL: 40, STENCILPASS: 41,
++    ALPHAREF: 42, FRONTWINDING: 43, ZBIAS: 45, COLORWRITEENABLE: 47, TEXTUREFACTOR: 53, SCISSORTESTENABLE: 55,
++    BLENDCOLOR: 56, SLOPESCALEDEPTHBIAS: 63, DEPTHBIAS: 64, SEPARATEALPHABLENDENABLE: 93, SRCBLENDALPHA: 94,
++    DSTBLENDALPHA: 95, BLENDEQUATIONALPHA: 96,
++};
++// Texture stage states (SVGA3dTextureStateName).
++const TS = {
++    BIND_TEXTURE: 1, COLOROP: 2, COLORARG1: 3, COLORARG2: 4, ALPHAOP: 5, ALPHAARG1: 6, ALPHAARG2: 7, ADDRESSU: 8,
++    ADDRESSV: 9, MIPFILTER: 10, MAGFILTER: 11, MINFILTER: 12, TEXCOORDINDEX: 14, TEXTURETRANSFORMFLAGS: 15,
++    TEXTURE_LOD_BIAS: 22, ADDRESSW: 24, COLORARG0: 28, ALPHAARG0: 29, CONSTANT: 30,
++};
++const TC = {
++    DISABLE: 1, SELECTARG1: 2, SELECTARG2: 3, MODULATE: 4, ADD: 5, ADDSIGNED: 6, SUBTRACT: 7,
++    BLENDTEXTUREALPHA: 8, BLENDDIFFUSEALPHA: 9, BLENDCURRENTALPHA: 10, BLENDFACTORALPHA: 11, MODULATE2X: 12,
++    MODULATE4X: 13, DSDT: 14, DOTPRODUCT3: 15, BLENDTEXTUREALPHAPM: 16, ADDSIGNED2X: 17, ADDSMOOTH: 18,
++    PREMODULATE: 19, MODULATEALPHA_ADDCOLOR: 20, MODULATECOLOR_ADDALPHA: 21, MODULATEINVALPHA_ADDCOLOR: 22,
++    MODULATEINVCOLOR_ADDALPHA: 23, BUMPENVMAPLUMINANCE: 24, MULTIPLYADD: 25, LERP: 26,
++};
++const TA = { TFACTOR: 1, PREVIOUS: 2, DIFFUSE: 3, TEXTURE: 4, SPECULAR: 5, CONSTANT: 6 };
++const TM_ALPHA = 0x10, TM_ONE_MINUS = 0x20;
++const DECLTYPE = { FLOAT1: 0, FLOAT2: 1, FLOAT3: 2, FLOAT4: 3, D3DCOLOR: 4, UBYTE4: 5, SHORT2: 6, SHORT4: 7, UBYTE4N: 8,
++    SHORT2N: 9, SHORT4N: 10, USHORT2N: 11, USHORT4N: 12, FLOAT16_2: 15, FLOAT16_4: 16 };
++const USAGE = { POSITION: 0, NORMAL: 3, PSIZE: 4, TEXCOORD: 5, POSITIONT: 9, COLOR: 10, FOG: 11 };
++const PRIM = { TRIANGLELIST: 1, POINTLIST: 2, LINELIST: 3, LINESTRIP: 4, TRIANGLESTRIP: 5, TRIANGLEFAN: 6 };
++const MAX_STAGES = 8;
++
++// Attribute locations.
++const ATTR = { POS: 0, COLOR0: 1, COLOR1: 2, TEX0: 3, NORMAL: 11 };   // TEX0..TEX7 = 3..10
++const TRANSFORM = { WORLD: 1, VIEW: 2, PROJECTION: 3 };
++const LIGHT = { POINT: 1, SPOT1: 2, SPOT2: 3, DIRECTIONAL: 4 };
++const MAX_LIGHTS = 8;
++
++
++// A vertex element with stride 0 is the same for every vertex (Direct3D allows it; OpenGL's current colour,
++// normal and texture coordinates use it). WebGL reads stride 0 as "tightly packed", so set it as a constant.
++const CONST_ATTR = new DataView(new ArrayBuffer(16));
++function constant_attrib(gl, loc, type, data, off)
++{
++    const v = [0, 0, 0, 1];
++    const avail = data.length - off;
++    if(avail <= 0) { gl.vertexAttrib4f(loc, 0, 0, 0, 1); return; }
++    const n = Math.min(16, avail);
++    for(let i = 0; i < n; i++) CONST_ATTR.setUint8(i, data[off + i]);
++    const dv = CONST_ATTR;
++    switch(type)
++    {
++        case DECLTYPE.FLOAT1: case DECLTYPE.FLOAT2: case DECLTYPE.FLOAT3: case DECLTYPE.FLOAT4:
++            for(let i = 0; i <= type - DECLTYPE.FLOAT1 && i * 4 + 4 <= n; i++) v[i] = dv.getFloat32(i * 4, true);
++            break;
++        case DECLTYPE.D3DCOLOR: case DECLTYPE.UBYTE4N:
++            for(let i = 0; i < 4; i++) v[i] = dv.getUint8(i) / 255;
++            break;
++        case DECLTYPE.UBYTE4:
++            for(let i = 0; i < 4; i++) v[i] = dv.getUint8(i);
++            break;
++        case DECLTYPE.SHORT2: case DECLTYPE.SHORT4:
++            for(let i = 0; i < (type === DECLTYPE.SHORT2 ? 2 : 4); i++) v[i] = dv.getInt16(i * 2, true);
++            break;
++        case DECLTYPE.SHORT2N: case DECLTYPE.SHORT4N:
++            for(let i = 0; i < (type === DECLTYPE.SHORT2N ? 2 : 4); i++) v[i] = Math.max(-1, dv.getInt16(i * 2, true) / 32767);
++            break;
++        default: break;
++    }
++    gl.vertexAttrib4f(loc, v[0], v[1], v[2], v[3]);
++}
++
++const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
++const as_float = v => { u32[0] = v; return f32[0]; };
++const argb = v => [(v >>> 16 & 255) / 255, (v >>> 8 & 255) / 255, (v & 255) / 255, (v >>> 24 & 255) / 255];
++
++/**
++ * @constructor
++ * @param {Object} svga the VMwareSVGA device
++ */
++export function SVGA3D(svga)
++{
++    this.svga = svga;
++    /** @type {?} */
++    this.gl = null;
++    this.failed = false;
++    this.surfaces = new Map();
++    this.contexts = new Map();
++    this.programs = new Map();
++    this.shaders = new Map();               // "cid:type:shid" → { tokens, version, tr }
++    this.shader_version = 0;
++    this.stats = { draws: 0, presents: 0, unsupported: Object.create(null) };
++    this["shader_dump"] = [];
++}
++
++// A plain view of VRAM. vga.svga_memory is a Proxy that builds a new typed array on every element access.
++SVGA3D.prototype.vram = function()
++{
++    const m = this.svga.vga.svga_memory, buf = this.svga.cpu.wasm_memory.buffer, off = m.byteOffset;
++    if(!this.vram_view || this.vram_view.buffer !== buf || this.vram_view.byteOffset !== off)
++    {
++        this.vram_view = new Uint8Array(buf, off, m.length);
++        this.vram_view32 = off % 4 ? null : new Uint32Array(buf, off, m.length >> 2);
++    }
++    return this.vram_view;
++};
++
++SVGA3D.prototype.init_gl = function()
++{
++    if(this.gl || this.failed) return this.gl;
++    try
++    {
++        const C = /** @type {?} */ (self)["OffscreenCanvas"];
++        const canvas = new C(16, 16);
++        const gl = canvas.getContext("webgl2", { "antialias": false, "depth": false, "stencil": false, "alpha": true,
++            "premultipliedAlpha": false, "preserveDrawingBuffer": false });
++        if(!gl) throw new Error("no webgl2");
++        this.gl = gl;
++        this.s3tc = gl.getExtension("WEBGL_compressed_texture_s3tc");
++        this.provoking = gl.getExtension("WEBGL_provoking_vertex");
++        this.fbo = gl.createFramebuffer();
++        this.fbo_read = gl.createFramebuffer();
++        this.samplers = [];
++        for(let i = 0; i < MAX_STAGES; i++) this.samplers.push(gl.createSampler());
++        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
++        gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
++        this.white = gl.createTexture();
++        gl.bindTexture(gl.TEXTURE_2D, this.white);
++        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
++        dbg_log("svga3d: WebGL2 ready (s3tc " + !!this.s3tc + ")", LOG_VGA);
++    }
++    catch(e)
++    {
++        this.failed = true;
++        dbg_log("svga3d: WebGL2 unavailable: " + e, LOG_VGA);
++    }
++    return this.gl;
++};
++
++SVGA3D.prototype.unsupported = function(what)
++{
++    this.stats.unsupported[what] = (this.stats.unsupported[what] || 0) + 1;
++};
++
++/**
++ * @param {number} id
++ * @param {Uint32Array} w command body (dwords after the header)
++ */
++SVGA3D.prototype.command = function(id, w)
++{
++    const gl = this.init_gl();
++    if(!gl) return;
++    const f = new Float32Array(w.buffer, w.byteOffset, w.length);
++    switch(id)
++    {
++        case CMD.SURFACE_DEFINE: return this.surface_define(w, 0);
++        case CMD.SURFACE_DEFINE_V2: return this.surface_define(w, 2);
++        case CMD.SURFACE_DESTROY: return this.surface_destroy(w[0]);
++        case CMD.SURFACE_DMA: return this.surface_dma(w);
++        case CMD.SURFACE_DMA_FORMAT: return this.surface_dma(w.subarray(1), w[0]);
++        case CMD.SURFACE_COPY: return this.surface_copy(w);
++        case CMD.SURFACE_STRETCHBLT: return this.surface_stretchblt(w);
++        case CMD.CONTEXT_DEFINE: this.contexts.set(w[0], this.new_context()); return;
++        case CMD.CONTEXT_DESTROY: this.contexts.delete(w[0]); return;
++        case CMD.SETRENDERSTATE:
++        {
++            const c = this.context(w[0]);
++            for(let i = 1; i + 1 < w.length; i += 2) c.rs[w[i]] = w[i + 1];
++            return;
++        }
++        case CMD.SETTEXTURESTATE:
++        {
++            const c = this.context(w[0]);
++            for(let i = 1; i + 2 < w.length; i += 3) if(w[i] < MAX_STAGES) c.ts[w[i]][w[i + 1]] = w[i + 2];
++            return;
++        }
++        case CMD.SETRENDERTARGET: this.context(w[0]).rt[w[1]] = w[2]; return;
++        case CMD.SETVIEWPORT: this.context(w[0]).viewport = [w[1], w[2], w[3], w[4]]; return;
++        case CMD.SETZRANGE: this.context(w[0]).zrange = [f[1], f[2]]; return;
++        case CMD.SETSCISSORRECT: this.context(w[0]).scissor = [w[1], w[2], w[3], w[4]]; return;
++        case CMD.SETTRANSFORM: this.context(w[0]).transform[w[1]] = Array.from(f.subarray(2, 18)); return;
++        case CMD.CLEAR: return this.clear(w, f);
++        case CMD.DRAW_PRIMITIVES: return this.draw(w);
++        case CMD.PRESENT: return this.present(w[0], w, 1);
++        case CMD.BLIT_SURFACE_TO_SCREEN: return this.blit_to_screen(w);
++        case CMD.PRESENT_READBACK: return;                  // presents already land in VRAM
++        case CMD.GENERATE_MIPMAPS: return this.generate_mipmaps(w[0]);
++        case CMD.BEGIN_QUERY: return;
++        case CMD.END_QUERY: case CMD.WAIT_FOR_QUERY: return this.query_result(w);
++        case CMD.SHADER_DEFINE:
++        {
++            if(this["shader_dump"].length < 64) this["shader_dump"].push(Array.from(w, x => (x >>> 0).toString(16)).join(","));
++            const tr = translate_shader(w[2], w.slice(3));
++            if(tr.errors.length) for(const e of tr.errors) this.unsupported("shader " + e);
++            this.shaders.set(w[0] + ":" + w[2] + ":" + w[1], { tr, version: ++this.shader_version });
++            return;
++        }
++        case CMD.SHADER_DESTROY: this.shaders.delete(w[0] + ":" + w[2] + ":" + w[1]); return;
++        case CMD.SET_SHADER:
++        {
++            const c = this.context(w[0]);
++            if(w[1] === SHADER_VS) c.vs = w[2]; else c.ps = w[2];
++            return;
++        }
++        case CMD.SET_SHADER_CONST:
++        {
++            const c = this.context(w[0]);
++            const reg = w[1], type = w[2], ctype = w[3];
++            for(let k = 4, r = reg; k + 3 < w.length; k += 4, r++)
++            {
++                if(ctype === 0) { const dst = type === SHADER_VS ? c.vsc : c.psc; if(r < 256) dst.set(f.subarray(k, k + 4), r * 4); }
++                else if(ctype === 1) { const dst = type === SHADER_VS ? c.vsi : c.psi; if(r < 16) dst.set(w.subarray(k, k + 4), r * 4); }
++                else { const dst = type === SHADER_VS ? c.vsb : c.psb; if(r < 16) dst[r] = w[k] ? 1 : 0; }
++            }
++            return;
++        }
++        case CMD.SETMATERIAL: this.context(w[0]).material = f.slice(2, 19); return;
++        case CMD.SETLIGHTDATA:
++        {
++            const c = this.context(w[0]);
++            const l = c.lights[w[1]] || (c.lights[w[1]] = { enabled: false });
++            l.type = w[2]; l.f = f.slice(4, 31);            // diffuse, specular, ambient, position, direction, range…phi
++            return;
++        }
++        case CMD.SETLIGHTENABLED:
++        {
++            const c = this.context(w[0]);
++            const l = c.lights[w[1]] || (c.lights[w[1]] = { enabled: false, type: LIGHT.DIRECTIONAL, f: new Float32Array(27) });
++            l.enabled = !!w[2];
++            return;
++        }
++        case CMD.SETCLIPPLANE: case CMD.ACTIVATE_SURFACE: case CMD.DEACTIVATE_SURFACE:
++            return;
++        default:
++            this.unsupported("cmd " + id);
++    }
++};
++
++// ---------- surfaces ----------
++
++SVGA3D.prototype.surface_define = function(w, extra)
++{
++    const gl = this.gl;
++    const sid = w[0], flags = w[1], format = w[2];
++    const faces = [w[3], w[4], w[5], w[6], w[7], w[8]];
++    const mips = [];
++    for(let i = 0; i < faces[0]; i++)
++    {
++        const o = 9 + extra + i * 3;
++        mips.push({ w: w[o], h: w[o + 1], d: w[o + 2] });
++    }
++    this.surface_destroy(sid);
++    const s = { sid, flags, format, faces, mips, w: mips[0].w, h: mips[0].h, tex: null, data: null, version: 0,
++        stream: !!(flags & SURFACE_STREAM), chunks: [],
++        gl_array: null, gl_index: null, array_version: -1, index_version: -1, depth: DEPTH_FORMATS.has(format) };
++    if(faces[1]) this.unsupported("cube surface");
++    if(format === FMT.BUFFER)
++    {
++        s.data = new Uint8Array(s.w);
++    }
++    else
++    {
++        s.tex = gl.createTexture();
++        gl.bindTexture(gl.TEXTURE_2D, s.tex);
++        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, mips.length - 1);
++        if(s.depth)
++        {
++            gl.texStorage2D(gl.TEXTURE_2D, mips.length, gl.DEPTH24_STENCIL8, s.w, s.h);
++        }
++        else if(DXT[format] && this.s3tc)
++        {
++            const ext = this.s3tc;
++            s.gl_format = format === FMT.DXT1 ? ext["COMPRESSED_RGBA_S3TC_DXT1_EXT"] :
++                format <= FMT.DXT3 ? ext["COMPRESSED_RGBA_S3TC_DXT3_EXT"] : ext["COMPRESSED_RGBA_S3TC_DXT5_EXT"];
++            gl.texStorage2D(gl.TEXTURE_2D, mips.length, s.gl_format, s.w, s.h);
++        }
++        else
++        {
++            if(DXT[format]) this.unsupported("dxt without s3tc");
++            gl.texStorage2D(gl.TEXTURE_2D, mips.length, gl.RGBA8, s.w, s.h);
++        }
++    }
++    this.surfaces.set(sid, s);
++};
++
++SVGA3D.prototype.surface_destroy = function(sid)
++{
++    const s = this.surfaces.get(sid);
++    if(!s) return;
++    const gl = this.gl;
++    if(s.tex) gl.deleteTexture(s.tex);
++    if(s.gl_array) gl.deleteBuffer(s.gl_array);
++    if(s.gl_index) gl.deleteBuffer(s.gl_index);
++    this.surfaces.delete(sid);
++};
++
++// A rectangle of guest memory (a GMR or VRAM) as one tightly packed buffer, rows of row_bytes.
++SVGA3D.prototype.read_rect = function(gmr, offset, pitch, row_bytes, rows)
++{
++    const svga = this.svga, out = new Uint8Array(row_bytes * rows);
++    for(let r = 0; r < rows; r++) out.set(svga.guest_read(gmr, offset + r * pitch, row_bytes), r * row_bytes);
++    return out;
++};
++
++SVGA3D.prototype.write_rect = function(gmr, offset, pitch, row_bytes, rows, data)
++{
++    for(let r = 0; r < rows; r++) this.svga.guest_write(gmr, offset + r * pitch, data.subarray(r * row_bytes, (r + 1) * row_bytes));
++};
++
++// fmt: format of the guest image when it differs from the surface's (the OpenGL runtime's uploads).
++SVGA3D.prototype.surface_dma = function(w, fmt = 0)
++{
++    const gmr = w[0], offset = w[1], pitch = w[2], sid = w[3], mip = w[5], transfer = w[6];
++    const s = this.surfaces.get(sid);
++    if(!s) return;
++    const boxes = Math.floor((w.length - 7) / 9);
++    for(let b = 0; b < boxes; b++)
++    {
++        const o = 7 + b * 9;
++        const x = w[o], y = w[o + 1], bw = w[o + 3], bh = w[o + 4], srcx = w[o + 6], srcy = w[o + 7];
++        if(s.data)
++        {
++            // Buffers: x/srcx are byte offsets, width is a byte count.
++            if(transfer === 1)
++            {
++                s.data.set(this.svga.guest_read(gmr, offset + srcx, bw), x);
++                s.version++;
++                if(s.stream)
++                {
++                    // Writes go round the ring in order and each piece is drawn right after it is written, so when
++                    // the ring wraps the older pieces are finished with.
++                    const last = s.chunks[s.chunks.length - 1];
++                    if(last && x < last.hi) s.chunks.length = 0;
++                    s.chunks.push({ lo: x, hi: Math.min(x + bw, s.data.length), gl: null });
++                }
++                const lo = Math.min(x, s.data.length), hi = Math.min(x + bw, s.data.length);
++                s.dirty_array = s.dirty_array ? [Math.min(s.dirty_array[0], lo), Math.max(s.dirty_array[1], hi)] : [lo, hi];
++                s.dirty_index = s.dirty_index ? [Math.min(s.dirty_index[0], lo), Math.max(s.dirty_index[1], hi)] : [lo, hi];
++            }
++            else this.svga.guest_write(gmr, offset + srcx, s.data.subarray(x, x + bw));
++        }
++        else if(transfer === 1)
++        {
++            this.upload(s, mip, x, y, bw, bh, gmr, offset, pitch, srcx, srcy, fmt);
++        }
++        else
++        {
++            this.readback(s, mip, x, y, bw, bh, gmr, offset, pitch, srcx, srcy);
++        }
++    }
++};
++
++// Guest pixels (format of s) → RGBA8.
++SVGA3D.prototype.to_rgba = function(format, vram, src, pitch, bw, bh)
++{
++    const out = new Uint8Array(bw * bh * 4);
++    const bpp = BYTES_PER_PIXEL[format] || 4;
++    if(format === FMT.RGBA8)
++    {
++        for(let y = 0; y < bh; y++) out.set(vram.subarray(src + y * pitch, src + y * pitch + bw * 4), y * bw * 4);
++        return out;
++    }
++    for(let y = 0; y < bh; y++)
++    {
++        let p = src + y * pitch, o = y * bw * 4;
++        for(let x = 0; x < bw; x++, p += bpp, o += 4)
++        {
++            let r = 0, g = 0, b = 0, a = 255, v;
++            switch(format)
++            {
++                case FMT.RGB8: r = vram[p]; g = vram[p + 1]; b = vram[p + 2]; break;
++                case FMT.BGR8: b = vram[p]; g = vram[p + 1]; r = vram[p + 2]; break;
++                case FMT.INTENSITY8: r = g = b = a = vram[p]; break;
++                case FMT.A8R8G8B8: a = vram[p + 3]; // fall through
++                case FMT.X8R8G8B8: b = vram[p]; g = vram[p + 1]; r = vram[p + 2]; break;
++                case FMT.R5G6B5: v = vram[p] | vram[p + 1] << 8;
++                    r = (v >> 11 & 31) * 255 / 31; g = (v >> 5 & 63) * 255 / 63; b = (v & 31) * 255 / 31; break;
++                case FMT.A1R5G5B5: v = vram[p] | vram[p + 1] << 8; a = v & 0x8000 ? 255 : 0;
++                    r = (v >> 10 & 31) * 255 / 31; g = (v >> 5 & 31) * 255 / 31; b = (v & 31) * 255 / 31; break;
++                case FMT.X1R5G5B5: v = vram[p] | vram[p + 1] << 8;
++                    r = (v >> 10 & 31) * 255 / 31; g = (v >> 5 & 31) * 255 / 31; b = (v & 31) * 255 / 31; break;
++                case FMT.A4R4G4B4: v = vram[p] | vram[p + 1] << 8;
++                    a = (v >> 12 & 15) * 17; r = (v >> 8 & 15) * 17; g = (v >> 4 & 15) * 17; b = (v & 15) * 17; break;
++                case FMT.LUMINANCE8: r = g = b = vram[p]; break;
++                case FMT.LUMINANCE8_ALPHA8: r = g = b = vram[p]; a = vram[p + 1]; break;
++                case FMT.LUMINANCE4_ALPHA4: r = g = b = (vram[p] & 15) * 17; a = (vram[p] >> 4) * 17; break;
++                case FMT.LUMINANCE16: r = g = b = vram[p + 1]; break;
++                case FMT.ALPHA8: r = g = b = 0; a = vram[p]; break;
++            }
++            out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = a;
++        }
++    }
++    return out;
++};
++
++// RGBA8 → guest pixels for colour formats (readback and present).
++SVGA3D.prototype.from_rgba = function(format, rgba, vram, dst, pitch, bw, bh)
++{
++    const bpp = format === 16 ? 2 : format === 32 ? 4 : (BYTES_PER_PIXEL[format] || 4);
++    const as565 = format === 16 || format === FMT.R5G6B5;
++    const as555 = format === FMT.X1R5G5B5 || format === FMT.A1R5G5B5;
++    for(let y = 0; y < bh; y++)
++    {
++        let p = dst + y * pitch, o = y * bw * 4;
++        for(let x = 0; x < bw; x++, p += bpp, o += 4)
++        {
++            const r = rgba[o], g = rgba[o + 1], b = rgba[o + 2], a = rgba[o + 3];
++            if(as565) { const v = (r >> 3) << 11 | (g >> 2) << 5 | b >> 3; vram[p] = v; vram[p + 1] = v >> 8; }
++            else if(as555) { const v = (a >= 128 ? 0x8000 : 0) | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3; vram[p] = v; vram[p + 1] = v >> 8; }
++            else if(format === FMT.A4R4G4B4) { const v = (a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | b >> 4; vram[p] = v; vram[p + 1] = v >> 8; }
++            else { vram[p] = b; vram[p + 1] = g; vram[p + 2] = r; vram[p + 3] = a; }
++        }
++    }
++};
++
++SVGA3D.prototype.upload = function(s, mip, x, y, bw, bh, gmr, base, pitch, srcx, srcy, fmt = 0)
++{
++    const gl = this.gl;
++    gl.bindTexture(gl.TEXTURE_2D, s.tex);
++    const block = DXT[s.format];
++    if(block)
++    {
++        if(!this.s3tc) return;
++        // Compressed: rows are rows of 4×4 blocks; coordinates are in pixels.
++        const bx = srcx >> 2, by = srcy >> 2, cols = Math.max(1, bw + 3 >> 2), rows = Math.max(1, bh + 3 >> 2);
++        const data = this.read_rect(gmr, base + by * pitch + bx * block, pitch, cols * block, rows);
++        const mw = Math.max(1, s.w >> mip), mh = Math.max(1, s.h >> mip);
++        gl.compressedTexSubImage2D(gl.TEXTURE_2D, mip, x, y, Math.min(cols * 4, mw - x), Math.min(rows * 4, mh - y),
++            s.gl_format, data);
++        return;
++    }
++    if(s.depth) { this.unsupported("depth upload"); return; }
++    const format = fmt || s.format;
++    const bpp = BYTES_PER_PIXEL[format] || 4;
++    const raw = this.read_rect(gmr, base + srcy * pitch + srcx * bpp, pitch, bw * bpp, bh);
++    const rgba = this.to_rgba(format, raw, 0, bw * bpp, bw, bh);
++    gl.texSubImage2D(gl.TEXTURE_2D, mip, x, y, bw, bh, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
++};
++
++SVGA3D.prototype.bind_read = function(s, mip)
++{
++    const gl = this.gl;
++    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.fbo_read);
++    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, s.tex, mip);
++};
++
++SVGA3D.prototype.read_rgba = function(s, mip, x, y, bw, bh)
++{
++    const gl = this.gl, out = new Uint8Array(bw * bh * 4);
++    this.bind_read(s, mip);
++    gl.readPixels(x, y, bw, bh, gl.RGBA, gl.UNSIGNED_BYTE, out);
++    return out;
++};
++
++SVGA3D.prototype.readback = function(s, mip, x, y, bw, bh, gmr, base, pitch, srcx, srcy)
++{
++    if(s.depth || DXT[s.format]) { this.unsupported("readback of format " + s.format); return; }
++    const bpp = BYTES_PER_PIXEL[s.format] || 4;
++    const rgba = this.read_rgba(s, mip, x, y, bw, bh);
++    const raw = new Uint8Array(bw * bh * bpp);
++    this.from_rgba(s.format, rgba, raw, 0, bw * bpp, bw, bh);
++    this.write_rect(gmr, base + srcy * pitch + srcx * bpp, pitch, bw * bpp, bh, raw);
++};
++
++SVGA3D.prototype.surface_copy = function(w)
++{
++    const src = this.surfaces.get(w[0]), dst = this.surfaces.get(w[3]);
++    if(!src || !dst || !src.tex || !dst.tex) return;
++    for(let o = 6; o + 8 < w.length; o += 9)
++    {
++        const x = w[o], y = w[o + 1], bw = w[o + 3], bh = w[o + 4], sx = w[o + 6], sy = w[o + 7];
++        this.blit(src, w[2], sx, sy, bw, bh, dst, w[5], x, y, bw, bh, false);
++    }
++};
++
++SVGA3D.prototype.surface_stretchblt = function(w)
++{
++    const src = this.surfaces.get(w[0]), dst = this.surfaces.get(w[3]);
++    if(!src || !dst || !src.tex || !dst.tex) return;
++    // boxSrc {x,y,z,w,h,d} at 6, boxDest at 12, mode at 18 (2 = linear).
++    this.blit(src, w[2], w[6], w[7], w[9], w[10], dst, w[5], w[12], w[13], w[15], w[16], w[18] === 2);
++};
++
++SVGA3D.prototype.blit = function(src, smip, sx, sy, sw, sh, dst, dmip, dx, dy, dw, dh, linear)
++{
++    const gl = this.gl;
++    const attach = src.depth ? gl.DEPTH_STENCIL_ATTACHMENT : gl.COLOR_ATTACHMENT0;
++    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.fbo_read);
++    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, attach, gl.TEXTURE_2D, src.tex, smip);
++    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.fbo);
++    this.detach_all();
++    gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, attach, gl.TEXTURE_2D, dst.tex, dmip);
++    gl.disable(gl.SCISSOR_TEST);
++    gl.blitFramebuffer(sx, sy, sx + sw, sy + sh, dx, dy, dx + dw, dy + dh,
++        src.depth ? gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT : gl.COLOR_BUFFER_BIT,
++        linear && !src.depth ? gl.LINEAR : gl.NEAREST);
++    if(src.depth) gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, attach, gl.TEXTURE_2D, null, 0);
++};
++
++SVGA3D.prototype.detach_all = function()
++{
++    const gl = this.gl;
++    gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
++    gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.TEXTURE_2D, null, 0);
++};
++
++SVGA3D.prototype.generate_mipmaps = function(sid)
++{
++    const s = this.surfaces.get(sid);
++    if(!s || !s.tex || DXT[s.format] || s.depth) return;
++    this.gl.bindTexture(this.gl.TEXTURE_2D, s.tex);
++    this.gl.generateMipmap(this.gl.TEXTURE_2D);
++};
++
++// ---------- contexts ----------
++
++SVGA3D.prototype.new_context = function()
++{
++    const ts = [];
++    for(let i = 0; i < MAX_STAGES; i++)
++    {
++        const t = [];
++        t[TS.BIND_TEXTURE] = INVALID_ID;
++        t[TS.COLOROP] = i === 0 ? TC.MODULATE : TC.DISABLE;
++        t[TS.COLORARG1] = TA.TEXTURE; t[TS.COLORARG2] = TA.PREVIOUS; t[TS.COLORARG0] = TA.PREVIOUS;
++        t[TS.ALPHAOP] = i === 0 ? TC.SELECTARG1 : TC.DISABLE;
++        t[TS.ALPHAARG1] = TA.TEXTURE; t[TS.ALPHAARG2] = TA.PREVIOUS; t[TS.ALPHAARG0] = TA.PREVIOUS;
++        t[TS.TEXCOORDINDEX] = i;
++        t[TS.ADDRESSU] = t[TS.ADDRESSV] = 1; t[TS.MAGFILTER] = t[TS.MINFILTER] = 1; t[TS.MIPFILTER] = 0;
++        ts.push(t);
++    }
++    const rs = [];
++    rs[RS.ZENABLE] = 1; rs[RS.ZWRITEENABLE] = 1; rs[RS.ZFUNC] = 4; rs[RS.CULLMODE] = 1; rs[RS.FRONTWINDING] = 1;
++    rs[RS.SRCBLEND] = 2; rs[RS.DSTBLEND] = 1; rs[RS.BLENDEQUATION] = 1; rs[RS.ALPHAFUNC] = 8; rs[RS.SHADEMODE] = 2;
++    rs[RS.COLORWRITEENABLE] = 15; rs[RS.STENCILFUNC] = 8; rs[RS.STENCILFAIL] = 1; rs[RS.STENCILZFAIL] = 1;
++    rs[RS.STENCILPASS] = 1; rs[RS.STENCILMASK] = 0xFFFFFFFF; rs[RS.STENCILWRITEMASK] = 0xFFFFFFFF;
++    rs[RS.TEXTUREFACTOR] = 0xFFFFFFFF;
++    rs[RS.LIGHTINGENABLE] = 0; rs[RS.VERTEXMATERIALENABLE] = 1; rs[RS.DIFFUSEMATERIALSOURCE] = 1;
++    rs[RS.SPECULARMATERIALSOURCE] = 2; rs[RS.LOCALVIEWER] = 1;
++    return { rs, ts, rt: new Array(10).fill(INVALID_ID), viewport: null, zrange: [0, 1], scissor: null, transform: [],
++        lights: [], material: new Float32Array([1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++        vs: INVALID_ID, ps: INVALID_ID, vsc: new Float32Array(1024), psc: new Float32Array(1024),
++        vsi: new Int32Array(64), psi: new Int32Array(64), vsb: new Int32Array(16), psb: new Int32Array(16) };
++};
++
++SVGA3D.prototype.context = function(cid)
++{
++    let c = this.contexts.get(cid);
++    if(!c) { c = this.new_context(); this.contexts.set(cid, c); }
++    return c;
++};
++
++// Bind the context's colour target (and depth-stencil) for drawing; returns the colour surface.
++SVGA3D.prototype.bind_targets = function(c)
++{
++    const gl = this.gl;
++    const color = this.surfaces.get(c.rt[2]);
++    const depth = this.surfaces.get(c.rt[0]);
++    if(!color || !color.tex) return null;
++    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
++    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color.tex, 0);
++    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.TEXTURE_2D,
++        depth && depth.depth && depth.w === color.w && depth.h === color.h ? depth.tex : null, 0);
++    return color;
++};
++
++SVGA3D.prototype.clear = function(w, f)
++{
++    const gl = this.gl, c = this.context(w[0]);
++    const color = this.bind_targets(c);
++    if(!color) return;
++    const flags = w[1];
++    let bits = 0;
++    if(flags & 1) { const [r, g, b, a] = argb(w[2]); gl.clearColor(r, g, b, a); bits |= gl.COLOR_BUFFER_BIT; }
++    if(flags & 2) { gl.clearDepth(f[3]); gl.depthMask(true); bits |= gl.DEPTH_BUFFER_BIT; }
++    if(flags & 4) { gl.clearStencil(w[4]); gl.stencilMask(0xFF); bits |= gl.STENCIL_BUFFER_BIT; }
++    gl.colorMask(true, true, true, true);
++    gl.enable(gl.SCISSOR_TEST);
++    const rects = w.length > 5 ? Math.floor((w.length - 5) / 4) : 0;
++    if(!rects) { gl.scissor(0, 0, color.w, color.h); gl.clear(bits); }
++    for(let i = 0; i < rects; i++)
++    {
++        const o = 5 + i * 4;
++        gl.scissor(w[o], w[o + 1], w[o + 2], w[o + 3]);
++        gl.clear(bits);
++    }
++};
++
++// ---------- drawing ----------
++
++const GL_BLEND = gl => [0, gl.ZERO, gl.ONE, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA,
++    gl.DST_ALPHA, gl.ONE_MINUS_DST_ALPHA, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA_SATURATE,
++    gl.CONSTANT_COLOR, gl.ONE_MINUS_CONSTANT_COLOR];
++const GL_CMP = gl => [gl.ALWAYS, gl.NEVER, gl.LESS, gl.EQUAL, gl.LEQUAL, gl.GREATER, gl.NOTEQUAL, gl.GEQUAL, gl.ALWAYS];
++const GL_STENCIL_OP = gl => [gl.KEEP, gl.KEEP, gl.ZERO, gl.REPLACE, gl.INCR, gl.DECR, gl.INVERT, gl.INCR_WRAP, gl.DECR_WRAP];
++const GL_EQ = gl => [gl.FUNC_ADD, gl.FUNC_ADD, gl.FUNC_SUBTRACT, gl.FUNC_REVERSE_SUBTRACT, gl.MIN, gl.MAX];
++
++SVGA3D.prototype.apply_render_states = function(c, color)
++{
++    const gl = this.gl, rs = c.rs;
++    // Depth.
++    const depth_attached = !!this.surfaces.get(c.rt[0]);
++    if(rs[RS.ZENABLE] && depth_attached) { gl.enable(gl.DEPTH_TEST); gl.depthFunc(GL_CMP(gl)[rs[RS.ZFUNC]] || gl.LEQUAL); }
++    else gl.disable(gl.DEPTH_TEST);
++    gl.depthMask(!!rs[RS.ZWRITEENABLE] && depth_attached);
++    const bias = as_float(rs[RS.DEPTHBIAS] | 0), slope = as_float(rs[RS.SLOPESCALEDEPTHBIAS] | 0);
++    if(bias || slope) { gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(slope, bias * (1 << 24)); }
++    else gl.disable(gl.POLYGON_OFFSET_FILL);
++    // Blending.
++    if(rs[RS.BLENDENABLE])
++    {
++        const B = GL_BLEND(gl), E = GL_EQ(gl);
++        gl.enable(gl.BLEND);
++        if(rs[RS.SEPARATEALPHABLENDENABLE])
++        {
++            gl.blendFuncSeparate(B[rs[RS.SRCBLEND]] ?? gl.ONE, B[rs[RS.DSTBLEND]] ?? gl.ZERO,
++                B[rs[RS.SRCBLENDALPHA]] ?? gl.ONE, B[rs[RS.DSTBLENDALPHA]] ?? gl.ZERO);
++            gl.blendEquationSeparate(E[rs[RS.BLENDEQUATION]] || gl.FUNC_ADD, E[rs[RS.BLENDEQUATIONALPHA]] || gl.FUNC_ADD);
++        }
++        else
++        {
++            gl.blendFunc(B[rs[RS.SRCBLEND]] ?? gl.ONE, B[rs[RS.DSTBLEND]] ?? gl.ZERO);
++            gl.blendEquation(E[rs[RS.BLENDEQUATION]] || gl.FUNC_ADD);
++        }
++        const [r, g, b, a] = argb(rs[RS.BLENDCOLOR] | 0);
++        gl.blendColor(r, g, b, a);
++    }
++    else gl.disable(gl.BLEND);
++    const m = rs[RS.COLORWRITEENABLE] ?? 15;
++    gl.colorMask(!!(m & 1), !!(m & 2), !!(m & 4), !!(m & 8));
++    // Culling: GL row y = Direct3D row y mirrors the screen, so a Direct3D clockwise triangle is GL counter-clockwise.
++    const cull = rs[RS.CULLMODE];
++    if(cull === 2 || cull === 3 || cull === 4)
++    {
++        gl.enable(gl.CULL_FACE);
++        gl.frontFace(rs[RS.FRONTWINDING] === 2 ? gl.CW : gl.CCW);
++        gl.cullFace(cull === 2 ? gl.FRONT : cull === 3 ? gl.BACK : gl.FRONT_AND_BACK);
++    }
++    else gl.disable(gl.CULL_FACE);
++    // Stencil.
++    if(rs[RS.STENCILENABLE])
++    {
++        const C = GL_CMP(gl), O = GL_STENCIL_OP(gl);
++        gl.enable(gl.STENCIL_TEST);
++        gl.stencilFunc(C[rs[RS.STENCILFUNC]] || gl.ALWAYS, rs[RS.STENCILREF] | 0, rs[RS.STENCILMASK] & 0xFF);
++        gl.stencilOp(O[rs[RS.STENCILFAIL]] || gl.KEEP, O[rs[RS.STENCILZFAIL]] || gl.KEEP, O[rs[RS.STENCILPASS]] || gl.KEEP);
++        gl.stencilMask(rs[RS.STENCILWRITEMASK] & 0xFF);
++    }
++    else gl.disable(gl.STENCIL_TEST);
++    // Viewport and scissor.
++    const vp = c.viewport || [0, 0, color.w, color.h];
++    gl.viewport(vp[0], vp[1], vp[2], vp[3]);
++    gl.depthRange(c.zrange[0], c.zrange[1]);
++    if(rs[RS.SCISSORTESTENABLE] && c.scissor) { gl.enable(gl.SCISSOR_TEST); gl.scissor(c.scissor[0], c.scissor[1], c.scissor[2], c.scissor[3]); }
++    else gl.disable(gl.SCISSOR_TEST);
++    if(this.provoking) this.provoking["provokingVertexWEBGL"](this.provoking["FIRST_VERTEX_CONVENTION_WEBGL"]);
++    return vp;
++};
++
++// Fragment program key: everything that changes the generated GLSL.
++SVGA3D.prototype.program_key = function(c, layout)
++{
++    const rs = c.rs;
++    let key = layout.key + "|" + (rs[RS.ALPHATESTENABLE] ? rs[RS.ALPHAFUNC] : 0) + (rs[RS.SPECULARENABLE] ? "s" : "") +
++        (rs[RS.FOGENABLE] ? "f" + (rs[RS.FOGMODE] >>> 0).toString(16) : "") + (rs[RS.SHADEMODE] === 1 ? "F" : "");
++    for(let i = 0; i < MAX_STAGES; i++)
++    {
++        const t = c.ts[i];
++        if(t[TS.COLOROP] === TC.DISABLE) break;
++        key += "|" + [t[TS.COLOROP], t[TS.COLORARG1], t[TS.COLORARG2], t[TS.COLORARG0], t[TS.ALPHAOP], t[TS.ALPHAARG1],
++            t[TS.ALPHAARG2], t[TS.ALPHAARG0], t[TS.TEXCOORDINDEX] & 7, t[TS.BIND_TEXTURE] !== INVALID_ID ? 1 : 0].join(",");
++    }
++    return key;
++};
++
++const COMBINE = (op, a1, a2, a0, swz) =>
++{
++    // swz: ".rgb" or ".a"
++    switch(op)
++    {
++        case TC.SELECTARG1: case TC.PREMODULATE: case TC.BUMPENVMAPLUMINANCE: case TC.DSDT: return a1;
++        case TC.SELECTARG2: return a2;
++        case TC.MODULATE: return `${a1} * ${a2}`;
++        case TC.MODULATE2X: return `${a1} * ${a2} * 2.0`;
++        case TC.MODULATE4X: return `${a1} * ${a2} * 4.0`;
++        case TC.ADD: return `${a1} + ${a2}`;
++        case TC.ADDSIGNED: return `${a1} + ${a2} - 0.5`;
++        case TC.ADDSIGNED2X: return `(${a1} + ${a2} - 0.5) * 2.0`;
++        case TC.SUBTRACT: return `${a1} - ${a2}`;
++        case TC.ADDSMOOTH: return `${a1} + ${a2} - ${a1} * ${a2}`;
++        case TC.BLENDDIFFUSEALPHA: return `mix(${a2}, ${a1}, diffuse.a)`;
++        case TC.BLENDTEXTUREALPHA: return `mix(${a2}, ${a1}, tex.a)`;
++        case TC.BLENDFACTORALPHA: return `mix(${a2}, ${a1}, u_tfactor.a)`;
++        case TC.BLENDCURRENTALPHA: return `mix(${a2}, ${a1}, cur.a)`;
++        case TC.BLENDTEXTUREALPHAPM: return `${a1} + ${a2} * (1.0 - tex.a)`;
++        case TC.MODULATEALPHA_ADDCOLOR: return swz === ".a" ? a1 : `${a1} + A1.a * ${a2}`;
++        case TC.MODULATECOLOR_ADDALPHA: return swz === ".a" ? a1 : `${a1} * ${a2} + A1.a`;
++        case TC.MODULATEINVALPHA_ADDCOLOR: return swz === ".a" ? a1 : `(1.0 - A1.a) * ${a2} + ${a1}`;
++        case TC.MODULATEINVCOLOR_ADDALPHA: return swz === ".a" ? a1 : `(1.0 - ${a1}) * ${a2} + A1.a`;
++        case TC.DOTPRODUCT3: return `vec3(clamp(4.0 * dot(A1.rgb - 0.5, A2.rgb - 0.5), 0.0, 1.0))${swz === ".a" ? ".x" : ""}`;
++        case TC.MULTIPLYADD: return `${a0} + ${a1} * ${a2}`;
++        case TC.LERP: return `mix(${a2}, ${a1}, ${a0})`;
++        default: return a1;
++    }
++};
++
++// ---------- fixed-function transform and lighting ----------
++
++// What the generated vertex shader depends on.
++SVGA3D.prototype.tnl_config = function(c, has_normal, has_c0, has_c1)
++{
++    const rs = c.rs;
++    const lighting = !!rs[RS.LIGHTINGENABLE];
++    const lights = [];
++    if(lighting) for(let i = 0; i < c.lights.length && lights.length < MAX_LIGHTS; i++)
++    {
++        const l = c.lights[i];
++        if(l && l.enabled && l.f) lights.push(i);
++    }
++    const src = (state, fallback) =>
++    {
++        // SVGA3dVertexMaterial: 0 material, 1 vertex colour 0, 2 vertex colour 1 (only when that colour exists).
++        if(!rs[RS.VERTEXMATERIALENABLE]) return 0;
++        const v = rs[state] ?? fallback;
++        return v === 1 && has_c0 ? 1 : v === 2 && has_c1 ? 2 : 0;
++    };
++    const fogmode = rs[RS.FOGMODE] >>> 0;
++    const vfog = rs[RS.FOGENABLE] && (fogmode >> 16 & 0xFF) === 1 && (fogmode & 0xFFFF) !== 4 ? fogmode & 0xFFFF : 0;
++    const cfg = {
++        lighting, lights, has_normal, has_c0, has_c1, vfog, range_fog: !!rs[RS.RANGEFOGENABLE],
++        specular: !!rs[RS.SPECULARENABLE], local: !!rs[RS.LOCALVIEWER], normalize: !!rs[RS.NORMALIZENORMALS],
++        dsrc: src(RS.DIFFUSEMATERIALSOURCE, 1), ssrc: src(RS.SPECULARMATERIALSOURCE, 2),
++        asrc: src(RS.AMBIENTMATERIALSOURCE, 0), esrc: src(RS.EMISSIVEMATERIALSOURCE, 0),
++        types: lights.map(i => c.lights[i].type),
++    };
++    cfg.key = [+lighting, cfg.types.join(""), +has_normal, +has_c0, +has_c1, vfog, +cfg.range_fog, +cfg.specular,
++        +cfg.local, +cfg.normalize, cfg.dsrc, cfg.ssrc, cfg.asrc, cfg.esrc].join(",");
++    return cfg;
++};
++
++SVGA3D.prototype.tnl_vertex_shader = function(t, flat)
++{
++    let vs = `#version 300 es
++precision highp float;
++layout(location=0) in vec4 a_pos;
++layout(location=1) in vec4 a_c0;
++layout(location=2) in vec4 a_c1;
++layout(location=${ATTR.NORMAL}) in vec3 a_normal;
++`;
++    for(let i = 0; i < 8; i++) vs += `layout(location=${ATTR.TEX0 + i}) in vec4 a_t${i};\n`;
++    vs += `uniform mat4 u_world, u_view, u_proj;
++uniform vec4 u_swz;
++uniform vec4 u_ambient;
++uniform vec4 u_mat[5];           // diffuse, ambient, specular, emissive, (power, 0, 0, 0)
++uniform vec4 u_light[${MAX_LIGHTS * 7}];   // per light: diffuse, specular, ambient, position (eye), direction (eye),
++                                 // (range, falloff, att0, att1), (att2, cos(theta/2), cos(phi/2), 0)
++uniform vec4 u_vfog;             // start, end, density
++${flat}out vec4 v_c0;
++${flat}out vec4 v_c1;
++`;
++    for(let i = 0; i < 8; i++) vs += `out vec4 v_t${i};\n`;
++    vs += `void main() {
++  vec4 c0 = u_swz.x > 0.5 ? a_c0.zyxw : a_c0;
++  vec4 c1 = u_swz.y > 0.5 ? a_c1.zyxw : a_c1;
++  mat4 wv = u_view * u_world;
++  vec4 eye = wv * vec4(a_pos.xyz, 1.0);
++  vec4 clip = u_proj * eye;
++  gl_Position = vec4(clip.x, -clip.y, 2.0 * clip.z - clip.w, clip.w);
++`;
++    for(let i = 0; i < 8; i++) vs += `  v_t${i} = a_t${i};\n`;
++    const pick = (src, mat) => src === 1 ? "c0" : src === 2 ? "c1" : mat;
++    if(!t.lighting)
++    {
++        vs += `  v_c0 = ${t.has_c0 ? "c0" : "vec4(1.0)"};\n  v_c1 = ${t.has_c1 ? "c1" : "vec4(0.0)"};\n`;
++    }
++    else
++    {
++        vs += `  vec3 n = ${t.has_normal ? "transpose(inverse(mat3(wv))) * a_normal" : "vec3(0.0)"};
++  if(dot(n, n) > 0.0) n = normalize(n);
++  vec3 to_eye = ${t.local ? "normalize(-eye.xyz)" : "vec3(0.0, 0.0, -1.0)"};
++  vec3 amb = vec3(0.0), dif = vec3(0.0), spe = vec3(0.0);
++  vec4 md = ${pick(t.dsrc, "u_mat[0]")}, ma = ${pick(t.asrc, "u_mat[1]")}, ms = ${pick(t.ssrc, "u_mat[2]")}, me = ${pick(t.esrc, "u_mat[3]")};
++  float power = u_mat[4].x;
++`;
++        t.types.forEach((type, i) =>
++        {
++            const b = i * 7;
++            vs += `  {
++    vec3 L; float att = 1.0;
++`;
++            if(type === LIGHT.DIRECTIONAL) vs += `    L = -normalize(u_light[${b + 4}].xyz);\n`;
++            else
++            {
++                vs += `    vec3 d = u_light[${b + 3}].xyz - eye.xyz; float dist = length(d); L = d / max(dist, 1e-6);
++    vec4 r = u_light[${b + 5}], r2 = u_light[${b + 6}];
++    att = dist > r.x ? 0.0 : 1.0 / max(r.z + r.w * dist + r2.x * dist * dist, 1e-6);
++`;
++                if(type === LIGHT.SPOT1 || type === LIGHT.SPOT2) vs += `    float rho = dot(normalize(u_light[${b + 4}].xyz), -L);
++    att *= rho > r2.y ? 1.0 : rho <= r2.z ? 0.0 : pow(clamp((rho - r2.z) / max(r2.y - r2.z, 1e-6), 0.0, 1.0), r.y);
++`;
++            }
++            vs += `    float nl = max(dot(n, L), 0.0);
++    amb += att * u_light[${b + 2}].rgb;
++    dif += att * nl * u_light[${b}].rgb;
++`;
++            if(t.specular) vs += `    if(nl > 0.0 && power > 0.0) spe += att * pow(max(dot(n, normalize(L + to_eye)), 0.0), power) * u_light[${b + 1}].rgb;\n`;
++            vs += "  }\n";
++        });
++        vs += `  v_c0 = vec4(clamp(me.rgb + ma.rgb * (u_ambient.rgb + amb) + md.rgb * dif, 0.0, 1.0), md.a);
++  v_c1 = vec4(clamp(ms.rgb * spe, 0.0, 1.0), ${t.has_c1 ? "c1.a" : "0.0"});
++`;
++    }
++    if(t.vfog)
++    {
++        const z = t.range_fog ? "length(eye.xyz)" : "abs(eye.z)";
++        const f = t.vfog === 3 ? `clamp((u_vfog.y - ${z}) / max(u_vfog.y - u_vfog.x, 1e-6), 0.0, 1.0)` :
++            t.vfog === 1 ? `exp(-${z} * u_vfog.z)` : `exp(-pow(${z} * u_vfog.z, 2.0))`;
++        vs += `  v_c1.a = ${f};\n`;
++    }
++    vs += "}\n";
++    return vs;
++};
++
++const mat4 = m => m && m.length === 16 ? m : [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
++// D3D row vectors: p' = p · M, i.e. (column-major) M as stored times a column vector.
++const xform = (m, x, y, z, w) => [m[0] * x + m[4] * y + m[8] * z + m[12] * w, m[1] * x + m[5] * y + m[9] * z + m[13] * w,
++    m[2] * x + m[6] * y + m[10] * z + m[14] * w];
++
++SVGA3D.prototype.tnl_uniforms = function(c, prog, t)
++{
++    const gl = this.gl, rs = c.rs;
++    const view = mat4(c.transform[TRANSFORM.VIEW]);
++    gl.uniformMatrix4fv(prog.world, false, mat4(c.transform[TRANSFORM.WORLD]));
++    gl.uniformMatrix4fv(prog.view, false, view);
++    gl.uniformMatrix4fv(prog.proj, false, mat4(c.transform[TRANSFORM.PROJECTION]));
++    if(t.vfog) gl.uniform4f(prog.vfog, as_float(rs[RS.FOGSTART] | 0), as_float(rs[RS.FOGEND] | 0), as_float(rs[RS.FOGDENSITY] | 0), 0);
++    if(!t.lighting) return;
++    const amb = argb(rs[RS.AMBIENT] >>> 0);
++    gl.uniform4f(prog.ambient, amb[0], amb[1], amb[2], amb[3]);
++    const m = c.material;
++    gl.uniform4fv(prog.mat, [m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
++        m[12], m[13], m[14], m[15], m[16], 0, 0, 0]);
++    if(!t.lights.length) return;
++    const out = new Float32Array(MAX_LIGHTS * 7 * 4);
++    t.lights.forEach((index, i) =>
++    {
++        const f = c.lights[index].f, o = i * 28;
++        out.set(f.subarray(0, 12), o);                                      // diffuse, specular, ambient
++        out.set(xform(view, f[12], f[13], f[14], 1), o + 12);               // position (eye space)
++        out.set(xform(view, f[16], f[17], f[18], 0), o + 16);               // direction (eye space)
++        const spot2 = c.lights[index].type === LIGHT.SPOT2;
++        const half = a => Math.cos(spot2 ? a / 2 : a * Math.PI / 360);       // SPOT1 angles are in degrees
++        out.set([f[20] || 3.4e38, f[21], f[22], f[23], f[24], half(f[25]), half(f[26]), 0], o + 20);
++    });
++    gl.uniform4fv(prog.lights, out);
++};
++
++SVGA3D.prototype.build_program = function(c, layout)
++{
++    const gl = this.gl, rs = c.rs;
++    const flat = rs[RS.SHADEMODE] === 1 ? "flat " : "";
++    let vs = layout.tnl ? this.tnl_vertex_shader(layout.tnl, flat) : `#version 300 es
++precision highp float;
++layout(location=0) in vec4 a_pos;
++layout(location=1) in vec4 a_c0;
++layout(location=2) in vec4 a_c1;
++`;
++    if(!layout.tnl)
++    {
++    for(let i = 0; i < 8; i++) vs += `layout(location=${ATTR.TEX0 + i}) in vec4 a_t${i};\n`;
++    vs += `uniform vec4 u_vp;
++uniform vec4 u_swz;      // 1 where colour 0 / colour 1 is D3DCOLOR (BGRA bytes)
++${flat}out vec4 v_c0;
++${flat}out vec4 v_c1;
++`;
++    for(let i = 0; i < 8; i++) vs += `out vec4 v_t${i};\n`;
++    vs += `void main() {
++  float w = a_pos.w != 0.0 ? 1.0 / a_pos.w : 1.0;
++  vec2 ndc = (a_pos.xy + 0.5 - u_vp.xy) / u_vp.zw * 2.0 - 1.0;
++  gl_Position = vec4(ndc * w, (a_pos.z * 2.0 - 1.0) * w, w);
++  v_c0 = u_swz.x > 0.5 ? a_c0.zyxw : a_c0;
++  v_c1 = u_swz.y > 0.5 ? a_c1.zyxw : a_c1;
++`;
++    for(let i = 0; i < 8; i++) vs += `  v_t${i} = a_t${i};\n`;
++    vs += "}\n";
++    }
++
++    let fs = `#version 300 es
++precision highp float;
++${flat}in vec4 v_c0;
++${flat}in vec4 v_c1;
++`;
++    for(let i = 0; i < 8; i++) fs += `in vec4 v_t${i};\n`;
++    fs += `uniform sampler2D u_tex[${MAX_STAGES}];
++uniform vec4 u_tfactor;
++uniform vec4 u_const[${MAX_STAGES}];
++uniform float u_alpharef;
++uniform vec4 u_fog;        // start, end, density, unused
++uniform vec3 u_fogcolor;
++out vec4 o_color;
++void main() {
++  vec4 diffuse = v_c0, specular = v_c1, cur = diffuse, tex = vec4(1.0), A0, A1, A2;
++`;
++    const arg = (a, s) =>
++    {
++        const src = a & 15;
++        let e = src === TA.TFACTOR ? "u_tfactor" : src === TA.DIFFUSE ? "diffuse" : src === TA.TEXTURE ? "tex" :
++            src === TA.SPECULAR ? "specular" : src === TA.CONSTANT ? `u_const[${s}]` : "cur";
++        if(a & TM_ALPHA) e = `${e}.aaaa`;
++        if(a & TM_ONE_MINUS) e = `(1.0 - ${e})`;
++        return e;
++    };
++    for(let s = 0; s < MAX_STAGES; s++)
++    {
++        const t = c.ts[s];
++        if(t[TS.COLOROP] === TC.DISABLE) break;
++        const tci = t[TS.TEXCOORDINDEX] & 7;
++        fs += `  tex = ${t[TS.BIND_TEXTURE] !== INVALID_ID ? `texture(u_tex[${s}], v_t${tci}.xy)` : "vec4(1.0)"};\n`;
++        fs += `  A1 = ${arg(t[TS.COLORARG1], s)}; A2 = ${arg(t[TS.COLORARG2], s)}; A0 = ${arg(t[TS.COLORARG0], s)};\n`;
++        const color = COMBINE(t[TS.COLOROP], "A1.rgb", "A2.rgb", "A0.rgb", ".rgb");
++        fs += `  vec3 c${s} = ${color};\n`;
++        const aop = t[TS.ALPHAOP] === TC.DISABLE ? TC.SELECTARG2 : t[TS.ALPHAOP];
++        const a2 = t[TS.ALPHAOP] === TC.DISABLE ? "cur" : arg(t[TS.ALPHAARG2], s);
++        fs += `  A1 = ${arg(t[TS.ALPHAARG1], s)}; A2 = ${a2}; A0 = ${arg(t[TS.ALPHAARG0], s)};\n`;
++        fs += `  float a${s} = ${COMBINE(aop, "A1.a", "A2.a", "A0.a", ".a")};\n`;
++        fs += `  cur = clamp(vec4(c${s}, a${s}), 0.0, 1.0);\n`;
++    }
++    if(rs[RS.SPECULARENABLE]) fs += "  cur.rgb = clamp(cur.rgb + specular.rgb, 0.0, 1.0);\n";
++    if(rs[RS.FOGENABLE])
++    {
++        const mode = rs[RS.FOGMODE] >>> 0, func = mode & 0xFFFF, type = mode >> 16 & 0xFF;
++        if(type === 2 && func !== 4)
++        {
++            // Table (pixel) fog on depth.
++            const z = "gl_FragCoord.z";
++            const factor = func === 3 ? `clamp((u_fog.y - ${z}) / max(u_fog.y - u_fog.x, 1e-6), 0.0, 1.0)` :
++                func === 1 ? `exp(-${z} * u_fog.z)` : `exp(-pow(${z} * u_fog.z, 2.0))`;
++            fs += `  cur.rgb = mix(u_fogcolor, cur.rgb, ${factor});\n`;
++        }
++        else
++        {
++            fs += "  cur.rgb = mix(u_fogcolor, cur.rgb, specular.a);\n";       // vertex fog: factor in specular alpha
++        }
++    }
++    if(rs[RS.ALPHATESTENABLE])
++    {
++        const cmp = ["", "false", "<", "==", "<=", ">", "!=", ">=", "true"][rs[RS.ALPHAFUNC]] || "true";
++        const test = cmp === "false" ? "false" : cmp === "true" ? "true" : `cur.a ${cmp} u_alpharef`;
++        fs += `  if(!(${test})) discard;\n`;
++    }
++    fs += "  o_color = cur;\n}\n";
++
++    const compile = (type, src) =>
++    {
++        const sh = gl.createShader(type);
++        gl.shaderSource(sh, src);
++        gl.compileShader(sh);
++        if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) dbg_log("svga3d shader: " + gl.getShaderInfoLog(sh) + "\n" + src, LOG_VGA);
++        return sh;
++    };
++    const p = gl.createProgram();
++    gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
++    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
++    gl.linkProgram(p);
++    if(!gl.getProgramParameter(p, gl.LINK_STATUS)) dbg_log("svga3d link: " + gl.getProgramInfoLog(p), LOG_VGA);
++    const u = name => gl.getUniformLocation(p, name);
++    const prog = { p, vp: u("u_vp"), swz: u("u_swz"), tex: u("u_tex"), tfactor: u("u_tfactor"), consts: u("u_const"),
++        alpharef: u("u_alpharef"), fog: u("u_fog"), fogcolor: u("u_fogcolor"),
++        world: u("u_world"), view: u("u_view"), proj: u("u_proj"), ambient: u("u_ambient"), mat: u("u_mat"),
++        lights: u("u_light"), vfog: u("u_vfog") };
++    gl.useProgram(p);
++    gl.uniform1iv(prog.tex, [0, 1, 2, 3, 4, 5, 6, 7]);
++    return prog;
++};
++
++SVGA3D.prototype.gl_buffer = function(s, index)
++{
++    const gl = this.gl;
++    const key = index ? "gl_index" : "gl_array", vkey = index ? "index_version" : "array_version";
++    const target = index ? gl.ELEMENT_ARRAY_BUFFER : gl.ARRAY_BUFFER;
++    const dkey = index ? "dirty_index" : "dirty_array";
++    const fresh = !s[key];
++    if(fresh) s[key] = gl.createBuffer();
++    gl.bindBuffer(target, s[key]);
++    if(s[vkey] !== s.version)
++    {
++        // Upload only what changed since this GL buffer was last brought up to date.
++        const d = s[dkey];
++        if(!fresh && d && s[vkey] >= 0) gl.bufferSubData(target, d[0], s.data, d[0], d[1] - d[0]);
++        else gl.bufferData(target, s.data, gl.DYNAMIC_DRAW);
++        s[vkey] = s.version;
++        s[dkey] = null;
++    }
++    return s[key];
++};
++
++// Bind the GL buffer holding byte `off` of buffer surface s; returns the offset to use within it.
++SVGA3D.prototype.bind_buffer = function(s, index, off)
++{
++    if(s.stream)
++    {
++        for(let i = s.chunks.length - 1; i >= 0; i--)
++        {
++            const c = s.chunks[i];
++            if(off < c.lo || off >= c.hi) continue;
++            const gl = this.gl, target = index ? gl.ELEMENT_ARRAY_BUFFER : gl.ARRAY_BUFFER;
++            if(!c.gl || c.gl.owner !== c)
++            {
++                const pool = index ? (this.stream_ib || (this.stream_ib = { n: 0, bufs: [] })) : (this.stream_vb || (this.stream_vb = { n: 0, bufs: [] }));
++                const k = pool.n++ % STREAM_POOL;
++                if(!pool.bufs[k]) pool.bufs[k] = { buf: gl.createBuffer(), owner: null };
++                c.gl = pool.bufs[k];
++                c.gl.owner = c;
++                gl.bindBuffer(target, c.gl.buf);
++                gl.bufferData(target, s.data.subarray(c.lo, c.hi), gl.STREAM_DRAW);
++            }
++            else gl.bindBuffer(target, c.gl.buf);
++            return off - c.lo;
++        }
++    }
++    this.gl_buffer(s, index);
++    return off;
++};
++
++// Indexed draw with a negative index bias (the forwarding runtimes send indices relative to the application's
++// arrays and vertices from the first one used): rebase the indices here and stream them.
++SVGA3D.prototype.draw_rebased = function(mode, n, is, ioffset, iwidth, bias)
++{
++    const gl = this.gl;
++    const src = iwidth === 4 ? new Uint32Array(is.data.buffer, is.data.byteOffset + ioffset, n) :
++        iwidth === 2 ? new Uint16Array(is.data.buffer, is.data.byteOffset + ioffset, n) : is.data.subarray(ioffset, ioffset + n);
++    const out = iwidth === 4 ? new Uint32Array(n) : new Uint16Array(n);
++    for(let i = 0; i < n; i++) out[i] = src[i] + bias;
++    const pool = this.stream_ib || (this.stream_ib = { n: 0, bufs: [] });
++    const k = pool.n++ % STREAM_POOL;
++    if(!pool.bufs[k]) pool.bufs[k] = { buf: gl.createBuffer(), owner: null };
++    pool.bufs[k].owner = null;
++    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, pool.bufs[k].buf);
++    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, out, gl.STREAM_DRAW);
++    gl.drawElements(mode, n, iwidth === 4 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0);
++};
++
++const ATTR_FORMAT = gl => ({
++    [DECLTYPE.FLOAT1]: [1, gl.FLOAT, false], [DECLTYPE.FLOAT2]: [2, gl.FLOAT, false],
++    [DECLTYPE.FLOAT3]: [3, gl.FLOAT, false], [DECLTYPE.FLOAT4]: [4, gl.FLOAT, false],
++    [DECLTYPE.D3DCOLOR]: [4, gl.UNSIGNED_BYTE, true], [DECLTYPE.UBYTE4]: [4, gl.UNSIGNED_BYTE, false],
++    [DECLTYPE.UBYTE4N]: [4, gl.UNSIGNED_BYTE, true], [DECLTYPE.SHORT2]: [2, gl.SHORT, false],
++    [DECLTYPE.SHORT4]: [4, gl.SHORT, false], [DECLTYPE.SHORT2N]: [2, gl.SHORT, true],
++    [DECLTYPE.SHORT4N]: [4, gl.SHORT, true], [DECLTYPE.USHORT2N]: [2, gl.UNSIGNED_SHORT, true],
++    [DECLTYPE.USHORT4N]: [4, gl.UNSIGNED_SHORT, true], [DECLTYPE.FLOAT16_2]: [2, gl.HALF_FLOAT, false],
++    [DECLTYPE.FLOAT16_4]: [4, gl.HALF_FLOAT, false],
++});
++
++SVGA3D.prototype.draw = function(w)
++{
++    const gl = this.gl, c = this.context(w[0]);
++    const ndecls = w[1], nranges = w[2];
++    const color = this.bind_targets(c);
++    if(!color) return;
++    this.stats.draws++;
++
++    // Vertex layout.
++    const decls = [];
++    let key = "", transformed = false, swz0 = 0, swz1 = 0, has_normal = false, has_c0 = false, has_c1 = false;
++    for(let i = 0; i < ndecls; i++)
++    {
++        const o = 3 + i * 9;
++        const d = { type: w[o], usage: w[o + 2], index: w[o + 3], sid: w[o + 4], offset: w[o + 5], stride: w[o + 6] };
++        decls.push(d);
++        key += d.type + ":" + d.usage + ":" + d.index + ",";
++        if(d.usage === USAGE.POSITIONT) transformed = true;
++        if(d.usage === USAGE.NORMAL) has_normal = true;
++        if(d.usage === USAGE.COLOR) { if(d.index === 0) has_c0 = true; else has_c1 = true; }
++        if(d.usage === USAGE.COLOR && d.type === DECLTYPE.D3DCOLOR) { if(d.index === 0) swz0 = 1; else swz1 = 1; }
++    }
++    const vs = this.shaders.get(w[0] + ":" + SHADER_VS + ":" + c.vs), ps = this.shaders.get(w[0] + ":" + SHADER_PS + ":" + c.ps);
++    if(!transformed && (vs || ps))
++    {
++        if(vs && ps) return this.draw_shaders(w, c, color, decls, vs, ps);
++        this.unsupported("shader mixed with fixed function");
++        return;
++    }
++    const tnl = transformed ? null : this.tnl_config(c, has_normal, has_c0, has_c1);
++
++    const vp = this.apply_render_states(c, color);
++    const layout = { key: key + (tnl ? "|T" + tnl.key : ""), tnl };
++    const pkey = this.program_key(c, layout);
++    let prog = this.programs.get(pkey);
++    if(!prog) { prog = this.build_program(c, layout); this.programs.set(pkey, prog); }
++    gl.useProgram(prog.p);
++    if(tnl) this.tnl_uniforms(c, prog, tnl);
++    gl.uniform4f(prog.vp, vp[0], vp[1], vp[2], vp[3]);
++    gl.uniform4f(prog.swz, swz0, swz1, 0, 0);
++    const tf = argb(c.rs[RS.TEXTUREFACTOR] >>> 0);
++    gl.uniform4f(prog.tfactor, tf[0], tf[1], tf[2], tf[3]);
++    gl.uniform1f(prog.alpharef, (c.rs[RS.ALPHAREF] & 255) / 255);
++    gl.uniform4f(prog.fog, as_float(c.rs[RS.FOGSTART] | 0), as_float(c.rs[RS.FOGEND] | 0), as_float(c.rs[RS.FOGDENSITY] | 0), 0);
++    const fc = argb(c.rs[RS.FOGCOLOR] | 0);
++    gl.uniform3f(prog.fogcolor, fc[0], fc[1], fc[2]);
++
++    // Textures and samplers.
++    for(let s = 0; s < MAX_STAGES; s++)
++    {
++        const t = c.ts[s];
++        gl.activeTexture(gl.TEXTURE0 + s);
++        const surf = t[TS.BIND_TEXTURE] !== INVALID_ID ? this.surfaces.get(t[TS.BIND_TEXTURE]) : null;
++        gl.bindTexture(gl.TEXTURE_2D, surf && surf.tex && !surf.depth ? surf.tex : this.white);
++        const smp = this.samplers[s];
++        const wrap = a => a === 2 ? gl.MIRRORED_REPEAT : a === 3 || a === 4 || a === 6 ? gl.CLAMP_TO_EDGE : gl.REPEAT;
++        gl.samplerParameteri(smp, gl.TEXTURE_WRAP_S, wrap(t[TS.ADDRESSU]));
++        gl.samplerParameteri(smp, gl.TEXTURE_WRAP_T, wrap(t[TS.ADDRESSV]));
++        const lin = f => f === 2 || f === 3;
++        const mip = t[TS.MIPFILTER], minl = lin(t[TS.MINFILTER]);
++        gl.samplerParameteri(smp, gl.TEXTURE_MAG_FILTER, lin(t[TS.MAGFILTER]) ? gl.LINEAR : gl.NEAREST);
++        gl.samplerParameteri(smp, gl.TEXTURE_MIN_FILTER, !mip ? (minl ? gl.LINEAR : gl.NEAREST) :
++            mip === 1 ? (minl ? gl.LINEAR_MIPMAP_NEAREST : gl.NEAREST_MIPMAP_NEAREST) :
++            (minl ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST_MIPMAP_LINEAR));
++        gl.bindSampler(s, smp);
++    }
++
++    // Attributes.
++    const AF = ATTR_FORMAT(gl);
++    const enabled = new Set(), constants = new Set();
++    const bind_attrs = vertex_bias =>
++    {
++        enabled.clear(); constants.clear();
++        for(const d of decls)
++        {
++            let loc = -1;
++            if(d.usage === USAGE.POSITIONT || d.usage === USAGE.POSITION) loc = d.index === 0 ? ATTR.POS : -1;
++            else if(d.usage === USAGE.NORMAL) loc = d.index === 0 ? ATTR.NORMAL : -1;
++            else if(d.usage === USAGE.COLOR) loc = d.index === 0 ? ATTR.COLOR0 : ATTR.COLOR1;
++            else if(d.usage === USAGE.TEXCOORD && d.index < 8) loc = ATTR.TEX0 + d.index;
++            if(loc < 0) continue;
++            const s = this.surfaces.get(d.sid), fmt = AF[d.type];
++            if(!s || !s.data || !fmt) continue;
++            if(d.stride === 0)
++            {
++                gl.disableVertexAttribArray(loc);
++                constant_attrib(gl, loc, d.type, s.data, d.offset);
++                enabled.add(loc);
++                constants.add(loc);
++                continue;
++            }
++            const off = this.bind_buffer(s, false, d.offset + vertex_bias * d.stride);
++            if(fmt[1] === gl.FLOAT || fmt[2] || fmt[1] === gl.HALF_FLOAT) gl.vertexAttribPointer(loc, fmt[0], fmt[1], fmt[2], d.stride, off);
++            else gl.vertexAttribPointer(loc, fmt[0], fmt[1], false, d.stride, off);
++            gl.enableVertexAttribArray(loc);
++            enabled.add(loc);
++        }
++        for(let loc = 0; loc <= ATTR.NORMAL; loc++)
++        {
++            if(enabled.has(loc) || constants.has(loc)) continue;
++            gl.disableVertexAttribArray(loc);
++            if(loc === ATTR.COLOR0) gl.vertexAttrib4f(loc, 1, 1, 1, 1);
++            else if(loc === ATTR.COLOR1) gl.vertexAttrib4f(loc, 0, 0, 0, 1);
++            else gl.vertexAttrib4f(loc, 0, 0, 0, 1);
++        }
++    };
++
++    for(let r = 0; r < nranges; r++)
++    {
++        const o = 3 + ndecls * 9 + r * 7;
++        const type = w[o], count = w[o + 1], isid = w[o + 2], ioffset = w[o + 3], iwidth = w[o + 5], bias = w[o + 6] | 0;
++        const mode = type === PRIM.TRIANGLELIST ? gl.TRIANGLES : type === PRIM.TRIANGLESTRIP ? gl.TRIANGLE_STRIP :
++            type === PRIM.TRIANGLEFAN ? gl.TRIANGLE_FAN : type === PRIM.LINELIST ? gl.LINES :
++            type === PRIM.LINESTRIP ? gl.LINE_STRIP : gl.POINTS;
++        const n = type === PRIM.TRIANGLELIST ? count * 3 : type === PRIM.TRIANGLESTRIP || type === PRIM.TRIANGLEFAN ? count + 2 :
++            type === PRIM.LINELIST ? count * 2 : type === PRIM.LINESTRIP ? count + 1 : count;
++        if(isid === INVALID_ID)
++        {
++            bind_attrs(0);
++            gl.drawArrays(mode, 0, n);
++        }
++        else
++        {
++            const is = this.surfaces.get(isid);
++            if(!is || !is.data) continue;
++            if(bias < 0)
++            {
++                if((ioffset + n * iwidth) > is.data.length || ioffset % iwidth) continue;
++                bind_attrs(0);
++                this.draw_rebased(mode, n, is, ioffset, iwidth, bias);
++                continue;
++            }
++            bind_attrs(bias);               // WebGL has no base vertex: shift the vertex arrays instead
++            const ioff = this.bind_buffer(is, true, ioffset);
++            gl.drawElements(mode, n, iwidth === 4 ? gl.UNSIGNED_INT : iwidth === 1 ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT, ioff);
++        }
++    }
++};
++
++// ---------- programmable path (shader model 2/3 from the guest) ----------
++
++SVGA3D.prototype.shader_program = function(c, vs, ps, swizzled)
++{
++    const rs = c.rs;
++    const alpha = rs[RS.ALPHATESTENABLE] ? rs[RS.ALPHAFUNC] : 0;
++    const key = "sh:" + vs.version + ":" + ps.version + ":" + swizzled.join(",") + ":" + alpha;
++    let prog = this.programs.get(key);
++    if(prog) return prog;
++    const gl = this.gl;
++    let vsrc = vs.tr.glsl, psrc = ps.tr.glsl;
++    // D3DCOLOR inputs arrive as BGRA bytes.
++    let pre = "";
++    for(const reg of swizzled)
++    {
++        vsrc = vsrc.replace(`in vec4 v${reg};`, `in vec4 v${reg}_raw;`);
++        pre += `  vec4 v${reg} = v${reg}_raw.zyxw;\n`;
++    }
++    // Pixel inputs the vertex shader does not write: declare them and zero them.
++    const extra = [];
++    for(const m of psrc.matchAll(/\bin vec4 (vary_\d+_\d+);/g)) if(!vsrc.includes(`out vec4 ${m[1]};`)) extra.push(m[1]);
++    for(const n of extra) pre += `  ${n} = vec4(0.0);\n`;
++    vsrc = vsrc.replace("void main() {\n", extra.map(n => `out vec4 ${n};\n`).join("") + "void main() {\n" + pre);
++    // Alpha test (still applies with pixel shaders in D3D9).
++    if(alpha)
++    {
++        const cmp = ["", "false", "<", "==", "<=", ">", "!=", ">=", "true"][alpha] || "true";
++        const test = cmp === "false" ? "false" : cmp === "true" ? "true" : `o_color0.a ${cmp} u_alpharef`;
++        psrc = psrc.replace(/\}\n$/, `  if(!(${test})) discard;\n}\n`).replace("void main() {", "uniform float u_alpharef;\nvoid main() {");
++    }
++    const compile = (type, src) =>
++    {
++        const sh = gl.createShader(type);
++        gl.shaderSource(sh, src);
++        gl.compileShader(sh);
++        if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { this.unsupported("compile"); this["shader_errors"] = (this["shader_errors"] || []).concat([gl.getShaderInfoLog(sh) + "\n" + src]).slice(-4); }
++        return sh;
++    };
++    const p = gl.createProgram();
++    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsrc));
++    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, psrc));
++    gl.linkProgram(p);
++    if(!gl.getProgramParameter(p, gl.LINK_STATUS)) { this.unsupported("link"); this["shader_errors"] = (this["shader_errors"] || []).concat([gl.getProgramInfoLog(p)]).slice(-4); }
++    const u = n => gl.getUniformLocation(p, n);
++    prog = { p, vc: u("u_vc"), vi: u("u_vi"), vb: u("u_vb"), pc: u("u_pc"), pi: u("u_pi"), pb: u("u_pb"), alpharef: u("u_alpharef"),
++        samplers: ps.tr.samplers.map(s => ({ reg: s.reg, loc: u("s" + s.reg) })) };
++    this.programs.set(key, prog);
++    return prog;
++};
++
++SVGA3D.prototype.draw_shaders = function(w, c, color, decls, vs, ps)
++{
++    const gl = this.gl;
++    const vp = this.apply_render_states(c, color);
++    void vp;
++    // Vertex declarations meet shader inputs by (usage, usage index).
++    const AF = ATTR_FORMAT(gl);
++    const bindings = [], swizzled = [];
++    for(const d of decls)
++    {
++        const inp = vs.tr.inputs.find(x => x.usage === d.usage && x.index === d.index) ||
++            (d.usage === USAGE.POSITIONT ? vs.tr.inputs.find(x => x.usage === USAGE.POSITION && x.index === d.index) : null);
++        if(!inp) continue;
++        bindings.push({ d, loc: inp.reg });
++        if(d.type === DECLTYPE.D3DCOLOR) swizzled.push(inp.reg);
++    }
++    const prog = this.shader_program(c, vs, ps, swizzled);
++    gl.useProgram(prog.p);
++    if(prog.vc) gl.uniform4fv(prog.vc, c.vsc);
++    if(prog.pc) gl.uniform4fv(prog.pc, c.psc);
++    if(prog.vi) gl.uniform4iv(prog.vi, c.vsi);
++    if(prog.pi) gl.uniform4iv(prog.pi, c.psi);
++    if(prog.vb) gl.uniform1iv(prog.vb, c.vsb);
++    if(prog.pb) gl.uniform1iv(prog.pb, c.psb);
++    if(prog.alpharef) gl.uniform1f(prog.alpharef, (c.rs[RS.ALPHAREF] & 255) / 255);
++    for(const s of prog.samplers)
++    {
++        if(!s.loc) continue;
++        gl.uniform1i(s.loc, s.reg);
++        this.bind_stage_texture(c, s.reg);
++    }
++    const bind_attrs = vertex_bias =>
++    {
++        const used = new Set();
++        for(const { d, loc } of bindings)
++        {
++            const s = this.surfaces.get(d.sid), fmt = AF[d.type];
++            if(!s || !s.data || !fmt) continue;
++            if(d.stride === 0)
++            {
++                gl.disableVertexAttribArray(loc);
++                constant_attrib(gl, loc, d.type, s.data, d.offset);
++                used.add(loc);
++                continue;
++            }
++            const off = this.bind_buffer(s, false, d.offset + vertex_bias * d.stride);
++            gl.vertexAttribPointer(loc, fmt[0], fmt[1], fmt[2], d.stride, off);
++            gl.enableVertexAttribArray(loc);
++            used.add(loc);
++        }
++        for(let loc = 0; loc < 16; loc++) if(!used.has(loc)) { gl.disableVertexAttribArray(loc); gl.vertexAttrib4f(loc, 0, 0, 0, 1); }
++    };
++    this.stats.draws++;
++    this.draw_ranges(w, decls.length, bind_attrs);
++};
++
++SVGA3D.prototype.bind_stage_texture = function(c, s)
++{
++    const gl = this.gl, t = c.ts[s];
++    gl.activeTexture(gl.TEXTURE0 + s);
++    const surf = t[TS.BIND_TEXTURE] !== INVALID_ID ? this.surfaces.get(t[TS.BIND_TEXTURE]) : null;
++    gl.bindTexture(gl.TEXTURE_2D, surf && surf.tex && !surf.depth ? surf.tex : this.white);
++    const smp = this.samplers[s];
++    const wrap = a => a === 2 ? gl.MIRRORED_REPEAT : a === 3 || a === 4 || a === 6 ? gl.CLAMP_TO_EDGE : gl.REPEAT;
++    gl.samplerParameteri(smp, gl.TEXTURE_WRAP_S, wrap(t[TS.ADDRESSU]));
++    gl.samplerParameteri(smp, gl.TEXTURE_WRAP_T, wrap(t[TS.ADDRESSV]));
++    const lin = f => f === 2 || f === 3;
++    const mip = t[TS.MIPFILTER], minl = lin(t[TS.MINFILTER]);
++    gl.samplerParameteri(smp, gl.TEXTURE_MAG_FILTER, lin(t[TS.MAGFILTER]) ? gl.LINEAR : gl.NEAREST);
++    gl.samplerParameteri(smp, gl.TEXTURE_MIN_FILTER, !mip ? (minl ? gl.LINEAR : gl.NEAREST) :
++        mip === 1 ? (minl ? gl.LINEAR_MIPMAP_NEAREST : gl.NEAREST_MIPMAP_NEAREST) :
++        (minl ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST_MIPMAP_LINEAR));
++    gl.bindSampler(s, smp);
++};
++
++SVGA3D.prototype.draw_ranges = function(w, ndecls, bind_attrs)
++{
++    const gl = this.gl;
++    const nranges = w[2];
++    for(let r = 0; r < nranges; r++)
++    {
++        const o = 3 + ndecls * 9 + r * 7;
++        const type = w[o], count = w[o + 1], isid = w[o + 2], ioffset = w[o + 3], iwidth = w[o + 5], bias = w[o + 6] | 0;
++        const mode = type === PRIM.TRIANGLELIST ? gl.TRIANGLES : type === PRIM.TRIANGLESTRIP ? gl.TRIANGLE_STRIP :
++            type === PRIM.TRIANGLEFAN ? gl.TRIANGLE_FAN : type === PRIM.LINELIST ? gl.LINES :
++            type === PRIM.LINESTRIP ? gl.LINE_STRIP : gl.POINTS;
++        const n = type === PRIM.TRIANGLELIST ? count * 3 : type === PRIM.TRIANGLESTRIP || type === PRIM.TRIANGLEFAN ? count + 2 :
++            type === PRIM.LINELIST ? count * 2 : type === PRIM.LINESTRIP ? count + 1 : count;
++        if(isid === INVALID_ID)
++        {
++            bind_attrs(0);
++            gl.drawArrays(mode, 0, n);
++        }
++        else
++        {
++            const is = this.surfaces.get(isid);
++            if(!is || !is.data) continue;
++            if(bias < 0)
++            {
++                if((ioffset + n * iwidth) > is.data.length || ioffset % iwidth) continue;
++                bind_attrs(0);
++                this.draw_rebased(mode, n, is, ioffset, iwidth, bias);
++                continue;
++            }
++            bind_attrs(bias);
++            const ioff = this.bind_buffer(is, true, ioffset);
++            gl.drawElements(mode, n, iwidth === 4 ? gl.UNSIGNED_INT : iwidth === 1 ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT, ioff);
++        }
++    }
++};
++
++// ---------- presentation ----------
++
++// A present copies the rectangles at once, on the GPU, into a screen-sized "front" texture; the front texture is
++// read back into VRAM once per screen refresh (flush_presents). Reading the presented surface itself at refresh
++// time would catch the next frame half drawn (applications start it right after presenting), and reading back at
++// every present would stall on the GPU far more often than the browser displays.
++SVGA3D.prototype.present = function(sid, w, first)
++{
++    this.stats.presents++;
++    const s = this.surfaces.get(sid);
++    if(!s || !s.tex) return;
++    const svga = this.svga, gl = this.gl;
++    const W = svga.width, H = svga.height;
++    let f = this.front;
++    if(!f || f.w !== W || f.h !== H)
++    {
++        if(f) gl.deleteTexture(f.tex);
++        f = this.front = { tex: gl.createTexture(), w: W, h: H, depth: false };
++        gl.bindTexture(gl.TEXTURE_2D, f.tex);
++        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, W, H);
++    }
++    this.pending = this.pending || new Map();
++    for(let o = first; o + 5 < w.length; o += 6)
++    {
++        const x = w[o], y = w[o + 1], sx = w[o + 4], sy = w[o + 5];
++        const bw = Math.min(w[o + 2], W - x, s.w - sx), bh = Math.min(w[o + 3], H - y, s.h - sy);
++        if(bw <= 0 || bh <= 0) continue;
++        this.blit(s, 0, sx, sy, bw, bh, f, 0, x, y, bw, bh, false);
++        const r = [x, y, bw, bh, x, y];
++        this.pending.set(r.join(","), r);
++    }
++};
++
++SVGA3D.prototype.flush_presents = function()
++{
++    if(!this.pending || !this.pending.size || !this.front) return;
++    const list = [...this.pending.values()];
++    this.pending.clear();
++    for(const r of list) this.present_now(this.front, r, 0);
++    this.stats["readbacks"] = (this.stats["readbacks"] || 0) + 1;
++    this.svga.vga.cpu.svga_mark_dirty();
++};
++
++// Copy rectangles of a surface onto the guest's screen (VRAM), in the screen's pixel format.
++SVGA3D.prototype.present_now = function(s, w, first)
++{
++    if(!s || !s.tex) return;
++    const svga = this.svga, vram = this.vram();
++    const bpp = svga.bpp, pitch = svga.bytes_per_line(), bytes = bpp + 7 >> 3;
++    for(let o = first; o + 5 < w.length; o += 6)
++    {
++        let x = w[o], y = w[o + 1], bw = w[o + 2], bh = w[o + 3];
++        const sx = w[o + 4], sy = w[o + 5];
++        bw = Math.min(bw, svga.width - x, s.w - sx); bh = Math.min(bh, svga.height - y, s.h - sy);
++        if(bw <= 0 || bh <= 0) continue;
++        if(bpp === 32 && this.vram_view32 && !(pitch & 3))
++        {
++            // Read straight into VRAM, then swap R and B in place.
++            const gl = this.gl, row = pitch >> 2, at = y * row + x;
++            this.bind_read(s, 0);
++            gl.pixelStorei(gl.PACK_ROW_LENGTH, row);
++            gl.readPixels(sx, sy, bw, bh, gl.RGBA, gl.UNSIGNED_BYTE, vram, at * 4);
++            gl.pixelStorei(gl.PACK_ROW_LENGTH, 0);
++            const v32 = this.vram_view32;
++            for(let j = 0; j < bh; j++)
++                for(let i = at + j * row, end = i + bw; i < end; i++)
++                {
++                    const v = v32[i];
++                    v32[i] = v & 0xFF00FF00 | (v & 0xFF) << 16 | (v >>> 16) & 0xFF;
++                }
++            continue;
++        }
++        const rgba = this.read_rgba(s, 0, sx, sy, bw, bh);
++        this.from_rgba(bpp === 16 ? 16 : 32, rgba, vram, y * pitch + x * bytes, pitch, bw, bh);
++    }
++};
++
++SVGA3D.prototype.blit_to_screen = function(w)
++{
++    // {srcImage sid,face,mip; srcRect l,t,r,b; destScreenId; destRect l,t,r,b} + clip rects
++    const sid = w[0], sl = w[3], st = w[4], dl = w[8], dt = w[9], dr = w[10], db = w[11];
++    this.present(sid, [dl, dt, dr - dl, db - dt, sl, st], 0);
++};
++
++SVGA3D.prototype.query_result = function(w)
++{
++    // {cid, type, guestResult {gmrId, offset}}: report "succeeded, 1 sample".
++    this.svga.guest_write(w[2], w[3], new Uint8Array(new Uint32Array([12, 2, 1]).buffer));
++};
+diff --git a/src/vmware_svga3d_shader.js b/src/vmware_svga3d_shader.js
+new file mode 100644
+index 0000000..c3ab9d5
+--- /dev/null
++++ b/src/vmware_svga3d_shader.js
+@@ -0,0 +1,392 @@
++// Direct3D 9 shader bytecode (vs/ps 2.0 and 3.0, as carried by SVGA_3D_CMD_SHADER_DEFINE) → GLSL ES 3.00.
++//
++// The token format is the public D3D9 one (d3d9types.h): a version token, then instructions (opcode in the low 16
++// bits, instruction length in bits 24-27), parameter tokens with register type/number, write masks, swizzles and
++// modifiers, comments, and an end token.
++//
++// Conventions of the generated code:
++// - vertex inputs v# use layout(location = #); the renderer binds vertex declarations by (usage, usage index);
++// - vertex outputs and pixel inputs meet as varyings named after (usage, usage index); POSITION is gl_Position;
++// - constants live in uniform arrays (u_c, u_i, u_b); `def`/`defi`/`defb` become local constants;
++// - D3D clip space is converted at the end of the vertex shader: y is negated (render targets keep row 0 at GL
++//   row 0) and z goes from [0, w] to [-w, w].
++
++const OP = {
++    NOP: 0, MOV: 1, ADD: 2, SUB: 3, MAD: 4, MUL: 5, RCP: 6, RSQ: 7, DP3: 8, DP4: 9, MIN: 10, MAX: 11, SLT: 12,
++    SGE: 13, EXP: 14, LOG: 15, LIT: 16, DST: 17, LRP: 18, FRC: 19, M4x4: 20, M4x3: 21, M3x4: 22, M3x3: 23,
++    M3x2: 24, CALL: 25, CALLNZ: 26, LOOP: 27, RET: 28, ENDLOOP: 29, LABEL: 30, DCL: 31, POW: 32, CRS: 33, SGN: 34,
++    ABS: 35, NRM: 36, SINCOS: 37, REP: 38, ENDREP: 39, IF: 40, IFC: 41, ELSE: 42, ENDIF: 43, BREAK: 44, BREAKC: 45,
++    MOVA: 46, DEFB: 47, DEFI: 48, TEXCOORD: 64, TEXKILL: 65, TEX: 66, EXPP: 78, LOGP: 79, CND: 80, DEF: 81,
++    CMP: 88, DP2ADD: 90, DSX: 91, DSY: 92, TEXLDD: 93, SETP: 94, TEXLDL: 95, BREAKP: 96,
++    PHASE: 0xFFFD, COMMENT: 0xFFFE, END: 0xFFFF,
++};
++const RT = {
++    TEMP: 0, INPUT: 1, CONST: 2, ADDR: 3, TEXTURE: 3, RASTOUT: 4, ATTROUT: 5, OUTPUT: 6, CONSTINT: 7, COLOROUT: 8,
++    DEPTHOUT: 9, SAMPLER: 10, CONST2: 11, CONST3: 12, CONST4: 13, CONSTBOOL: 14, LOOP: 15, TEMPFLOAT16: 16,
++    MISCTYPE: 17, LABEL: 18, PREDICATE: 19,
++};
++const USAGE_POSITION = 0, USAGE_PSIZE = 4, USAGE_TEXCOORD = 5, USAGE_COLOR = 10, USAGE_FOG = 11, USAGE_POSITIONT = 9;
++const SWZ = "xyzw";
++
++const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
++const as_float = v => { u32[0] = v; return f32[0]; };
++const glsl_float = x => { if(!isFinite(x)) return x > 0 ? "1e38" : x < 0 ? "-1e38" : "0.0"; const s = String(x); return /[.e]/.test(s) ? s : s + ".0"; };
++
++export const SHADER_VS = 1, SHADER_PS = 2;
++
++/**
++ * @param {number} type SHADER_VS or SHADER_PS
++ * @param {Uint32Array} t token stream (version token first)
++ * @return {{ glsl: string, inputs: Array, outputs: Array, samplers: Array, errors: Array<string> }}
++ */
++export function translate_shader(type, t)
++{
++    const ps = type === SHADER_PS;
++    const major = t[0] >> 8 & 0xFF, minor = t[0] & 0xFF;
++    const errors = [];
++    const inputs = [], outputs = [], samplers = [];
++    const temps = new Set(), local_consts = [], local_ints = [], local_bools = [];
++    const body = [];
++    let indent = "  ";
++    let uses_addr = false, uses_loop = false, uses_pred = false, uses_texcoord_out = false;
++
++    const reg_type = p => (p >>> 28 & 7) | (p >>> 8 & 0x18);
++    const reg_num = p => p & 0x7FF;
++
++    // ---------- declarations pass ----------
++    let i = 1;
++    const instrs = [];
++    while(i < t.length)
++    {
++        const tok = t[i];
++        const op = tok & 0xFFFF;
++        if(op === OP.END) break;
++        if(op === OP.COMMENT) { i += 1 + (tok >>> 16 & 0x7FFF); continue; }
++        let len = tok >>> 24 & 0xF;
++        if(major < 2)
++        {
++            // ps/vs 1.x have no length field: count parameter tokens (bit 31 set).
++            len = 0;
++            while(i + 1 + len < t.length && t[i + 1 + len] & 0x80000000) len++;
++        }
++        instrs.push({ op, control: tok >>> 16 & 0xFF, predicated: !!(tok & 0x10000000), args: t.subarray(i + 1, i + 1 + len) });
++        i += 1 + len;
++    }
++
++    for(const ins of instrs)
++    {
++        if(ins.op === OP.DCL)
++        {
++            const usage_tok = ins.args[0], d = ins.args[1];
++            const rt = reg_type(d), n = reg_num(d);
++            if(rt === RT.SAMPLER) samplers.push({ reg: n, kind: usage_tok >>> 27 & 0xF });   // 2 = 2D, 3 = cube, 4 = volume
++            else if(rt === RT.INPUT) inputs.push({ reg: n, usage: usage_tok & 0x1F, index: usage_tok >>> 16 & 0xF });
++            else if(rt === RT.OUTPUT) outputs.push({ reg: n, usage: usage_tok & 0x1F, index: usage_tok >>> 16 & 0xF });
++            else if(rt === RT.TEXTURE && ps) inputs.push({ reg: n, usage: USAGE_TEXCOORD, index: n, texture_reg: true });
++            else if(rt === RT.MISCTYPE) { /* vPos / vFace */ }
++        }
++        else if(ins.op === OP.DEF)
++        {
++            local_consts.push({ reg: reg_num(ins.args[0]), v: Array.from(ins.args.subarray(1, 5), as_float) });
++        }
++        else if(ins.op === OP.DEFI) local_ints.push({ reg: reg_num(ins.args[0]), v: Array.from(ins.args.subarray(1, 5), x => x | 0) });
++        else if(ins.op === OP.DEFB) local_bools.push({ reg: reg_num(ins.args[0]), v: !!ins.args[1] });
++    }
++    // Shader model 2 without dcl for samplers (ps_2_0 always declares; vs_2 has none) and implicit inputs.
++    if(ps && major < 3)
++    {
++        for(const ins of instrs) if(ins.op === OP.DCL && reg_type(ins.args[1]) === RT.INPUT)
++        {
++            const inp = inputs.find(x => x.reg === reg_num(ins.args[1]));
++            if(inp) { inp.usage = USAGE_COLOR; inp.index = inp.reg; }
++        }
++    }
++    const const_override = new Map(local_consts.map(c => [c.reg, c.v]));
++
++    // ---------- registers ----------
++    const varying = (usage, index) => `vary_${usage}_${index}`;
++    const output_name = n =>
++    {
++        const o = outputs.find(x => x.reg === n);
++        if(!o) return `o_unused${n}`;
++        if(o.usage === USAGE_POSITION || o.usage === USAGE_POSITIONT) return "o_pos";
++        if(o.usage === USAGE_PSIZE) return "o_psize";
++        return varying(o.usage, o.index);
++    };
++    const reg_name = (p, rel = null) =>
++    {
++        const rt = reg_type(p), n = reg_num(p);
++        switch(rt)
++        {
++            case RT.TEMP: temps.add(n); return `r${n}`;
++            case RT.INPUT:
++                if(!ps) return `v${n}`;
++                if(major < 3) return n === 0 ? varying(USAGE_COLOR, 0) : varying(USAGE_COLOR, 1);
++                { const inp = inputs.find(x => x.reg === n); return inp ? varying(inp.usage, inp.index) : "vec4(0.0)"; }
++            case RT.CONST: case RT.CONST2: case RT.CONST3: case RT.CONST4:
++            {
++                const base = n + (rt === RT.CONST2 ? 2048 : rt === RT.CONST3 ? 4096 : rt === RT.CONST4 ? 6144 : 0);
++                if(rel) return `u_c[${base} + ${rel}]`;
++                return const_override.has(base) ? `k${base}` : `u_c[${base}]`;
++            }
++            case RT.ADDR:
++                if(ps) return varying(USAGE_TEXCOORD, n);          // ps 2.x texture coordinate register t#
++                uses_addr = true; return "vec4(a0)";
++            case RT.RASTOUT: return n === 0 ? "o_pos" : n === 1 ? "o_fog" : "o_psize";
++            case RT.ATTROUT: return varying(USAGE_COLOR, n);
++            case RT.OUTPUT: return major >= 3 ? output_name(n) : (uses_texcoord_out = true, varying(USAGE_TEXCOORD, n));
++            case RT.CONSTINT: return local_ints.some(x => x.reg === n) ? `ki${n}` : `u_i[${n}]`;
++            case RT.COLOROUT: return `o_color${n}`;
++            case RT.DEPTHOUT: return "o_depth";
++            case RT.SAMPLER: return `s${n}`;
++            case RT.CONSTBOOL: return local_bools.some(x => x.reg === n) ? `kb${n}` : `u_b[${n}]`;
++            case RT.LOOP: uses_loop = true; return "aL";
++            case RT.MISCTYPE: return n === 0 ? "vec4(gl_FragCoord.xy - 0.5, 0.0, 0.0)" : "vec4(gl_FrontFacing ? -1.0 : 1.0)";
++            case RT.PREDICATE: uses_pred = true; return "p0";
++            default: errors.push("register type " + rt); return "vec4(0.0)";
++        }
++    };
++    const is_int_reg = p => { const rt = reg_type(p); return rt === RT.CONSTINT || rt === RT.LOOP; };
++
++    // Relative addressing token follows a source parameter when bit 13 is set (sm2+).
++    let cursor = 0, cur_args = null;
++    const next = () => cur_args[cursor++];
++    const read_src = () =>
++    {
++        const p = next();
++        let rel = null;
++        if(p & 0x2000)
++        {
++            if(major >= 2) { const r = next(); const rc = r >>> 16 & 3; rel = (reg_type(r) === RT.LOOP ? (uses_loop = true, "aL") : (uses_addr = true, "a0")) + "." + SWZ[rc]; }
++            else { uses_addr = true; rel = "a0.x"; }
++        }
++        return { p, rel };
++    };
++    const swizzle_of = p => { const s = p >>> 16 & 0xFF; return SWZ[s & 3] + SWZ[s >> 2 & 3] + SWZ[s >> 4 & 3] + SWZ[s >> 6 & 3]; };
++    const src = (s, as_int = false) =>
++    {
++        const p = s.p;
++        let e = reg_name(p, s.rel);
++        if(reg_type(p) === RT.CONSTBOOL) return e;
++        if(is_int_reg(p) && !as_int) e = `vec4(${e})`;
++        const sw = swizzle_of(p);
++        if(sw !== "xyzw") e = `(${e}).${sw}`;
++        switch(p >>> 24 & 0xF)
++        {
++            case 0: return e;
++            case 1: return `(-${e})`;
++            case 2: return `(${e} - 0.5)`;
++            case 3: return `(-(${e} - 0.5))`;
++            case 4: return `(${e} * 2.0 - 1.0)`;
++            case 5: return `(-(${e} * 2.0 - 1.0))`;
++            case 6: return `(1.0 - ${e})`;
++            case 7: return `(${e} * 2.0)`;
++            case 8: return `(-(${e} * 2.0))`;
++            case 9: return `(${e} / (${e}).z)`;
++            case 10: return `(${e} / (${e}).w)`;
++            case 11: return `abs(${e})`;
++            case 12: return `(-abs(${e}))`;
++            case 13: return `(!${e})`;
++        }
++        return e;
++    };
++    const scalar = s => `(${src(s)}).x`;
++    // Destination: write mask, saturate.
++    const write = (d, expr) =>
++    {
++        const mask = d >>> 16 & 0xF, sat = d >>> 20 & 1;
++        const name = reg_name(d);
++        if(reg_type(d) === RT.ADDR && !ps)
++        {
++            const m = SWZ.split("").filter((_, k) => mask >> k & 1).join("");
++            return `a0.${m} = ivec4(floor((${expr}) + 0.5)).${m};`;
++        }
++        const v = sat ? `clamp(${expr}, 0.0, 1.0)` : expr;
++        if(mask === 0xF) return `${name} = ${v};`;
++        const m = SWZ.split("").filter((_, k) => mask >> k & 1).join("");
++        return `${name}.${m} = (${v}).${m};`;
++    };
++
++    const cmp_op = c => ["", ">", "==", ">=", "<", "!=", "<="][c] || "==";
++
++    for(const ins of instrs)
++    {
++        cur_args = ins.args; cursor = 0;
++        const op = ins.op;
++        if(op === OP.DCL || op === OP.DEF || op === OP.DEFI || op === OP.DEFB || op === OP.NOP || op === OP.PHASE) continue;
++        let line = null;
++        const D = () => next();
++        switch(op)
++        {
++            case OP.MOV: { const d = D(), a = read_src(); line = write(d, src(a)); break; }
++            case OP.MOVA: { const d = D(), a = read_src(); uses_addr = true; line = `a0 = ivec4(floor(${src(a)} + 0.5));`; void d; break; }
++            case OP.ADD: { const d = D(), a = read_src(), b = read_src(); line = write(d, `${src(a)} + ${src(b)}`); break; }
++            case OP.SUB: { const d = D(), a = read_src(), b = read_src(); line = write(d, `${src(a)} - ${src(b)}`); break; }
++            case OP.MUL: { const d = D(), a = read_src(), b = read_src(); line = write(d, `${src(a)} * ${src(b)}`); break; }
++            case OP.MAD: { const d = D(), a = read_src(), b = read_src(), c = read_src(); line = write(d, `${src(a)} * ${src(b)} + ${src(c)}`); break; }
++            case OP.RCP: { const d = D(), a = read_src(); line = write(d, `vec4(1.0 / ${scalar(a)})`); break; }
++            case OP.RSQ: { const d = D(), a = read_src(); line = write(d, `vec4(inversesqrt(abs(${scalar(a)})))`); break; }
++            case OP.DP3: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(dot((${src(a)}).xyz, (${src(b)}).xyz))`); break; }
++            case OP.DP4: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(dot(${src(a)}, ${src(b)}))`); break; }
++            case OP.DP2ADD: { const d = D(), a = read_src(), b = read_src(), c = read_src(); line = write(d, `vec4(dot((${src(a)}).xy, (${src(b)}).xy) + ${scalar(c)})`); break; }
++            case OP.MIN: { const d = D(), a = read_src(), b = read_src(); line = write(d, `min(${src(a)}, ${src(b)})`); break; }
++            case OP.MAX: { const d = D(), a = read_src(), b = read_src(); line = write(d, `max(${src(a)}, ${src(b)})`); break; }
++            case OP.SLT: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(lessThan(${src(a)}, ${src(b)}))`); break; }
++            case OP.SGE: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(greaterThanEqual(${src(a)}, ${src(b)}))`); break; }
++            case OP.EXP: case OP.EXPP: { const d = D(), a = read_src(); line = write(d, `vec4(exp2(${scalar(a)}))`); break; }
++            case OP.LOG: case OP.LOGP: { const d = D(), a = read_src(); line = write(d, `vec4(${scalar(a)} == 0.0 ? -1e38 : log2(abs(${scalar(a)})))`); break; }
++            case OP.POW: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(pow(abs(${scalar(a)}), ${scalar(b)}))`); break; }
++            case OP.FRC: { const d = D(), a = read_src(); line = write(d, `fract(${src(a)})`); break; }
++            case OP.ABS: { const d = D(), a = read_src(); line = write(d, `abs(${src(a)})`); break; }
++            case OP.SGN: { const d = D(), a = read_src(); line = write(d, `sign(${src(a)})`); break; }
++            case OP.NRM: { const d = D(), a = read_src(); line = write(d, `vec4(normalize((${src(a)}).xyz), 1.0)`); break; }
++            case OP.CRS: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(cross((${src(a)}).xyz, (${src(b)}).xyz), 0.0)`); break; }
++            case OP.LRP: { const d = D(), a = read_src(), b = read_src(), c = read_src(); line = write(d, `mix(${src(c)}, ${src(b)}, ${src(a)})`); break; }
++            case OP.CMP: { const d = D(), a = read_src(), b = read_src(), c = read_src(); line = write(d, `mix(${src(c)}, ${src(b)}, vec4(greaterThanEqual(${src(a)}, vec4(0.0))))`); break; }
++            case OP.CND: { const d = D(), a = read_src(), b = read_src(), c = read_src(); line = write(d, `mix(${src(c)}, ${src(b)}, vec4(greaterThan(${src(a)}, vec4(0.5))))`); break; }
++            case OP.LIT:
++            {
++                const d = D(), a = read_src(), s = src(a);
++                line = write(d, `vec4(1.0, max((${s}).x, 0.0), (${s}).x > 0.0 ? pow(max((${s}).y, 0.0), clamp((${s}).w, -127.9961, 127.9961)) : 0.0, 1.0)`);
++                break;
++            }
++            case OP.DST: { const d = D(), a = read_src(), b = read_src(); line = write(d, `vec4(1.0, (${src(a)}).y * (${src(b)}).y, (${src(a)}).z, (${src(b)}).w)`); break; }
++            case OP.SINCOS: { const d = D(), a = read_src(); if(major < 3) { next(); next(); } line = write(d, `vec4(cos(${scalar(a)}), sin(${scalar(a)}), 0.0, 0.0)`); break; }
++            case OP.M4x4: case OP.M4x3: case OP.M3x4: case OP.M3x3: case OP.M3x2:
++            {
++                const d = D(), a = read_src(), b = read_src();
++                const rows = op === OP.M4x4 || op === OP.M3x4 ? 4 : op === OP.M3x2 ? 2 : 3;
++                const n3 = op === OP.M3x4 || op === OP.M3x3 || op === OP.M3x2;
++                const parts = [];
++                for(let r = 0; r < rows; r++)
++                {
++                    const row = Object.assign({}, b); row.p = (b.p & ~0x7FF) | (reg_num(b.p) + r);
++                    parts.push(n3 ? `dot((${src(a)}).xyz, (${src(row)}).xyz)` : `dot(${src(a)}, ${src(row)})`);
++                }
++                while(parts.length < 4) parts.push("0.0");
++                line = write(d, `vec4(${parts.join(", ")})`);
++                break;
++            }
++            case OP.TEX:
++            {
++                if(major < 2) { errors.push("ps_1 tex"); break; }
++                const d = D(), a = read_src(), s = read_src();
++                const smp = samplers.find(x => x.reg === reg_num(s.p)), kind = smp ? smp.kind : 2;
++                const coord = src(a), name = `s${reg_num(s.p)}`;
++                const project = ins.control & 1, bias = ins.control & 2;
++                const c = kind === 3 ? `(${coord}).xyz` : kind === 4 ? `(${coord}).xyz` : `(${coord}).xy`;
++                const pc = project ? (kind === 2 ? `(${coord}).xy / (${coord}).w` : `(${coord}).xyz / (${coord}).w`) : c;
++                line = write(d, bias ? `texture(${name}, ${pc}, (${coord}).w)` : `texture(${name}, ${pc})`);
++                break;
++            }
++            case OP.TEXLDL:
++            {
++                const d = D(), a = read_src(), s = read_src();
++                const smp = samplers.find(x => x.reg === reg_num(s.p)), kind = smp ? smp.kind : 2;
++                const coord = src(a);
++                line = write(d, `textureLod(s${reg_num(s.p)}, (${coord}).${kind === 2 ? "xy" : "xyz"}, (${coord}).w)`);
++                break;
++            }
++            case OP.TEXLDD:
++            {
++                const d = D(), a = read_src(), s = read_src(), dx = read_src(), dy = read_src();
++                const smp = samplers.find(x => x.reg === reg_num(s.p)), kind = smp ? smp.kind : 2, sw = kind === 2 ? "xy" : "xyz";
++                line = write(d, `textureGrad(s${reg_num(s.p)}, (${src(a)}).${sw}, (${src(dx)}).${sw}, (${src(dy)}).${sw})`);
++                break;
++            }
++            case OP.TEXKILL:
++            {
++                const d = D();
++                line = `if(any(lessThan((${reg_name(d)}).xyz, vec3(0.0)))) discard;`;
++                break;
++            }
++            case OP.DSX: { const d = D(), a = read_src(); line = write(d, `dFdx(${src(a)})`); break; }
++            case OP.DSY: { const d = D(), a = read_src(); line = write(d, `dFdy(${src(a)})`); break; }
++            case OP.IF: { const a = read_src(); line = `if(${src(a)}) {`; body.push(indent + line); indent += "  "; line = null; break; }
++            case OP.IFC: { const a = read_src(), b = read_src(); body.push(indent + `if(${scalar(a)} ${cmp_op(ins.control & 7)} ${scalar(b)}) {`); indent += "  "; break; }
++            case OP.ELSE: indent = indent.slice(2); body.push(indent + "} else {"); indent += "  "; break;
++            case OP.ENDIF: case OP.ENDREP: case OP.ENDLOOP: indent = indent.slice(2); body.push(indent + "}"); break;
++            case OP.REP:
++            {
++                const a = read_src();
++                body.push(indent + `for(int rep = 0; rep < ${src(a, true)}.x; rep++) {`); indent += "  ";
++                break;
++            }
++            case OP.LOOP:
++            {
++                const l = read_src(), a = read_src(); void l;
++                uses_loop = true;
++                const it = src(a, true);
++                body.push(indent + `aL = ${it}.y; for(int loop = 0; loop < ${it}.x; loop++, aL += ${it}.z) {`); indent += "  ";
++                break;
++            }
++            case OP.BREAK: body.push(indent + "break;"); break;
++            case OP.BREAKC: { const a = read_src(), b = read_src(); body.push(indent + `if(${scalar(a)} ${cmp_op(ins.control & 7)} ${scalar(b)}) break;`); break; }
++            case OP.SETP: { const d = D(), a = read_src(), b = read_src(); uses_pred = true; line = `p0 = ${["", "greaterThan", "equal", "greaterThanEqual", "lessThan", "notEqual", "lessThanEqual"][ins.control & 7] || "equal"}(${src(a)}, ${src(b)});`; void d; break; }
++            case OP.RET: break;
++            default:
++                errors.push("opcode " + op);
++        }
++        if(line) body.push(indent + (ins.predicated ? `/* predicated */ ` : "") + line);
++    }
++
++    // ---------- assemble ----------
++    let g = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
++    g += "uniform vec4 u_c[256];\nuniform ivec4 u_i[16];\nuniform bool u_b[16];\n";
++    if(!ps)
++    {
++        for(const inp of inputs) g += `layout(location=${inp.reg}) in vec4 v${inp.reg};\n`;
++        for(const o of outputs) if(o.usage !== USAGE_POSITION && o.usage !== USAGE_POSITIONT && o.usage !== USAGE_PSIZE) g += `out vec4 ${varying(o.usage, o.index)};\n`;
++        if(major < 3)
++        {
++            g += `out vec4 ${varying(USAGE_COLOR, 0)};\nout vec4 ${varying(USAGE_COLOR, 1)};\n`;
++            for(let k = 0; k < 8; k++) g += `out vec4 ${varying(USAGE_TEXCOORD, k)};\n`;
++        }
++    }
++    else
++    {
++        const seen = new Set();
++        for(const inp of inputs) { const n = varying(inp.usage, inp.index); if(!seen.has(n)) { seen.add(n); g += `in vec4 ${n};\n`; } }
++        if(major < 3)
++        {
++            for(const n of [varying(USAGE_COLOR, 0), varying(USAGE_COLOR, 1)]) if(!seen.has(n)) { seen.add(n); g += `in vec4 ${n};\n`; }
++            for(let k = 0; k < 8; k++) { const n = varying(USAGE_TEXCOORD, k); if(!seen.has(n)) { seen.add(n); g += `in vec4 ${n};\n`; } }
++        }
++        for(const s of samplers) g += `uniform ${s.kind === 3 ? "samplerCube" : s.kind === 4 ? "sampler3D" : "sampler2D"} s${s.reg};\n`;
++        g += "layout(location=0) out vec4 o_color0;\n";
++    }
++    g += "void main() {\n";
++    for(const n of [...temps].sort((a, b) => a - b)) g += `  vec4 r${n} = vec4(0.0);\n`;
++    for(const c of local_consts) g += `  const vec4 k${c.reg} = vec4(${c.v.map(glsl_float).join(", ")});\n`;
++    for(const c of local_ints) g += `  const ivec4 ki${c.reg} = ivec4(${c.v.join(", ")});\n`;
++    for(const c of local_bools) g += `  const bool kb${c.reg} = ${c.v};\n`;
++    if(uses_addr) g += "  ivec4 a0 = ivec4(0);\n";
++    if(uses_loop) g += "  int aL = 0;\n";
++    if(uses_pred) g += "  bvec4 p0 = bvec4(false);\n";
++    if(!ps)
++    {
++        g += "  vec4 o_pos = vec4(0.0, 0.0, 0.0, 1.0);\n  vec4 o_psize = vec4(1.0);\n  vec4 o_fog = vec4(0.0);\n";
++        for(const o of outputs) if(o.usage === USAGE_COLOR) g += `  ${varying(o.usage, o.index)} = vec4(1.0);\n`;
++        for(const o of outputs) if(o.usage !== USAGE_COLOR && o.usage !== USAGE_POSITION && o.usage !== USAGE_POSITIONT && o.usage !== USAGE_PSIZE) g += `  ${varying(o.usage, o.index)} = vec4(0.0);\n`;
++        if(major < 3) { g += `  ${varying(USAGE_COLOR, 0)} = vec4(1.0);\n  ${varying(USAGE_COLOR, 1)} = vec4(0.0);\n`; for(let k = 0; k < 8; k++) g += `  ${varying(USAGE_TEXCOORD, k)} = vec4(0.0);\n`; }
++    }
++    else
++    {
++        g += "  o_color0 = vec4(0.0);\n  vec4 o_depth = vec4(gl_FragCoord.z);\n";
++        if(major < 3) g += "  vec4 o_color1 = vec4(0.0), o_color2 = vec4(0.0), o_color3 = vec4(0.0);\n";
++        else g += "  vec4 o_color1 = vec4(0.0), o_color2 = vec4(0.0), o_color3 = vec4(0.0);\n";
++    }
++    g += body.join("\n") + "\n";
++    if(!ps)
++    {
++        // D3D clip space → GL: negate y (row 0 stays row 0), z from [0, w] to [-w, w].
++        g += "  gl_Position = vec4(o_pos.x, -o_pos.y, o_pos.z * 2.0 - o_pos.w, o_pos.w);\n  gl_PointSize = o_psize.x;\n";
++    }
++    else if(body.some(l => l.includes("o_depth"))) g += "  gl_FragDepth = o_depth.x;\n";
++    g += "}\n";
++    void uses_texcoord_out; void minor;
++    // Separate constant sets per stage: the two shaders are linked into one program.
++    const pre = ps ? "u_p" : "u_v";
++    g = g.replace(/\bu_c\[/g, pre + "c[").replace(/\bu_i\[/g, pre + "i[").replace(/\bu_b\[/g, pre + "b[");
++    return { glsl: g, inputs, outputs, samplers, errors };
++}
