@@ -119,6 +119,13 @@ async function launch(m, app) {
   const sleep = t => new Promise(r => setTimeout(r, t));
   const c = call(`m.input.pointer.moveTo(…); m.input.key("Meta+R"); <em>await</em> m.input.type("${app.name.toLowerCase()}…")`);
   try {
+    // A restored guest pages its working set in from the disk first; over the network that can take many seconds, and keys
+    // typed meanwhile are lost. Wait until it has stopped reading (two quiet seconds, at most 90 s).
+    const disk0 = m.disks.get("hd0"); let last = -1, quiet = 0;
+    for (let t = performance.now(); alive() && quiet < 2 && performance.now() - t < 90000; ) {
+      await sleep(1000); const f = (await disk0.access()).bytesFetched;
+      quiet = f === last ? quiet + 1 : 0; last = f; status(`Running · loading ${app.name}'s desktop, disk read ${mb(f)}`, "running");
+    }
     m.input.pointer.moveTo(500, 400); await sleep(300); m.input.pointer.moveTo(520, 420); await sleep(500);
     m.input.key("MetaLeft", true); m.input.key("KeyR", true); m.input.key("KeyR", false); m.input.key("MetaLeft", false);
     await sleep(1500);
