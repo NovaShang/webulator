@@ -5,7 +5,7 @@
     "adapter": "v86",
     "module": "../assets/cores/v86-svga/libv86.mjs",
     "wasm": "../assets/cores/v86-svga/v86.wasm",
-    "buildId": "sha256:a778a4041a0138d2ab70bf16be2881d54efc33eed7e701c16bfae1ca114cf2df"
+    "buildId": "sha256:bbaa4ecce9ee9143db2a4ce6e3cf9fef20d7972b45f5e4b840a331f26305e98e"
   },
   "machine": {
     "name": "PC (Pentium, PIIX, VMware SVGA II)",

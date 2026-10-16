@@ -129,6 +129,7 @@ async function explore() {
     if (op === "key") { for (const k of arg.split("+")) m.input.key(k, true); for (const k of arg.split("+").reverse()) m.input.key(k, false); }
     if (op === "type") await m.input.type(decodeURIComponent(arg));
     if (op === "shot") await shot(m, "explore-" + arg);
+    if (op === "save") await putFile(arg + ".webusnap", await m.saveState());
     if (op === "debug") m._debug();
     if (op === "prof") console.log("PROF " + arg);
     if (op === "wait") await sleep(a);
